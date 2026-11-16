@@ -55,6 +55,7 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLoginSuccess, onOpenPayP
                 <input
                   type="text"
                   required
+                  autoComplete="username"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                   placeholder="ইউজারনেম লিখুন"
@@ -70,6 +71,7 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLoginSuccess, onOpenPayP
                 <input
                   type={showPwd ? 'text' : 'password'}
                   required
+                  autoComplete="current-password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="পাসওয়ার্ড লিখুন"
@@ -113,35 +115,6 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLoginSuccess, onOpenPayP
               {loading ? 'লগইন হচ্ছে...' : 'লগইন করুন'}
             </button>
           </form>
-
-          {/* Quick Demo Credentials Helper */}
-          <div className="mt-5 border-t border-slate-200 pt-4">
-            <p className="text-xs font-medium text-slate-500">দ্রুত পরীক্ষণের জন্য ডেমো অ্যাকাউন্ট:</p>
-            <div className="mt-2 grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  setUsername('admin');
-                  setPassword('admin123');
-                }}
-                className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-left text-xs hover:border-[#0f4c5c] hover:bg-teal-50/40"
-              >
-                <span className="block font-semibold text-slate-900">অ্যাডমিন (Admin)</span>
-                <span className="font-mono-num text-[11px] text-slate-500">admin / admin123</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setUsername('rafiq');
-                  setPassword('1234');
-                }}
-                className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-left text-xs hover:border-[#0f4c5c] hover:bg-teal-50/40"
-              >
-                <span className="block font-semibold text-slate-900">কালেক্টর (রফিক)</span>
-                <span className="font-mono-num text-[11px] text-slate-500">rafiq / 1234</span>
-              </button>
-            </div>
-          </div>
         </div>
 
         {/* Public Customer E-Billing Portal Button */}

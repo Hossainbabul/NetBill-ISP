@@ -916,23 +916,38 @@ export const CollectorsView: React.FC<CollectorsViewProps> = ({
                   <input
                     type="text"
                     required
+                    pattern="^[A-Za-z0-9._-]{3,32}$"
                     disabled={Boolean(editing)}
                     value={formState.Username}
                     onChange={(e) => setFormState({ ...formState, Username: e.target.value })}
+                    placeholder="যেমন: karim_bd"
                     className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono-num text-sm disabled:bg-slate-100"
                   />
+                  <p className="mt-1 text-[11px] text-slate-500">
+                    ৩–৩২ অক্ষর: ইংরেজি অক্ষর, সংখ্যা, . _ -
+                  </p>
                 </div>
                 <div>
                   <label className="mb-1 block text-xs font-semibold text-slate-700">
                     {editing ? 'নতুন পাসওয়ার্ড (ঐচ্ছিক)' : 'পাসওয়ার্ড *'}
                   </label>
                   <input
-                    type="text"
+                    type="password"
+                    autoComplete="new-password"
                     required={!editing}
+                    minLength={8}
                     value={formState.Password}
                     onChange={(e) => setFormState({ ...formState, Password: e.target.value })}
+                    placeholder={
+                      editing
+                        ? 'পরিবর্তন করতে চাইলে ৮+ অক্ষর'
+                        : 'কমপক্ষে ৮ অক্ষরের শক্ত পাসওয়ার্ড'
+                    }
                     className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono-num text-sm"
                   />
+                  <p className="mt-1 text-[11px] text-slate-500">
+                    কমপক্ষে ৮ অক্ষরের শক্ত পাসওয়ার্ড
+                  </p>
                 </div>
               </div>
 

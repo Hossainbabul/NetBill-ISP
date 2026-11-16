@@ -592,6 +592,7 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
               <div>
                 <label className="mb-1 block text-xs font-semibold text-slate-700">সার্ভিসের ধরন</label>
                 <select
+                  disabled={Boolean(editingCustomer) && !isAdmin}
                   value={formState.ServiceType}
                   onChange={(e) => {
                     const st = e.target.value as ServiceType;
@@ -602,7 +603,7 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
                       MonthlyBill: st === 'Internet' ? '800' : '300',
                     });
                   }}
-                  className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+                  className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm disabled:bg-slate-100 disabled:text-slate-500"
                 >
                   <option value="Internet">ব্রডব্যান্ড ইন্টারনেট (ISP)</option>
                   <option value="Cable TV">ক্যাবল টিভি (ডিস লাইন)</option>
@@ -612,9 +613,10 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
               <div>
                 <label className="mb-1 block text-xs font-semibold text-slate-700">প্যাকেজ</label>
                 <select
+                  disabled={Boolean(editingCustomer) && !isAdmin}
                   value={formState.Package}
                   onChange={(e) => setFormState({ ...formState, Package: e.target.value })}
-                  className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+                  className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm disabled:bg-slate-100 disabled:text-slate-500"
                 >
                   {(formState.ServiceType === 'Internet' ? INTERNET_PACKAGES : CABLE_PACKAGES).map(
                     (p) => (
@@ -632,10 +634,16 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
                   type="number"
                   min={0}
                   required
+                  disabled={Boolean(editingCustomer) && !isAdmin}
                   value={formState.MonthlyBill}
                   onChange={(e) => setFormState({ ...formState, MonthlyBill: e.target.value })}
-                  className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono-num text-sm"
+                  className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono-num text-sm disabled:bg-slate-100 disabled:text-slate-500"
                 />
+                {Boolean(editingCustomer) && !isAdmin && (
+                  <p className="mt-1 text-[11px] text-slate-500">
+                    সার্ভিস, প্যাকেজ ও বিল শুধু অ্যাডমিন পরিবর্তন করতে পারবেন
+                  </p>
+                )}
               </div>
 
               {!editingCustomer && (
@@ -653,20 +661,22 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
                       className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono-num text-sm"
                     />
                   </div>
-                  <div>
-                    <label className="mb-1 block text-xs font-semibold text-slate-700">
-                      পূর্বের বকেয়া (Opening Balance)
-                    </label>
-                    <input
-                      type="number"
-                      min={0}
-                      value={formState.OpeningBalance}
-                      onChange={(e) =>
-                        setFormState({ ...formState, OpeningBalance: e.target.value })
-                      }
-                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono-num text-sm"
-                    />
-                  </div>
+                  {isAdmin && (
+                    <div>
+                      <label className="mb-1 block text-xs font-semibold text-slate-700">
+                        পূর্বের বকেয়া (Opening Balance)
+                      </label>
+                      <input
+                        type="number"
+                        min={0}
+                        value={formState.OpeningBalance}
+                        onChange={(e) =>
+                          setFormState({ ...formState, OpeningBalance: e.target.value })
+                        }
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono-num text-sm"
+                      />
+                    </div>
+                  )}
                 </>
               )}
 

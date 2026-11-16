@@ -52,6 +52,10 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
 
   const res = await fetch(url, { ...options, headers });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && url !== '/api/auth/login' && typeof window !== 'undefined') {
+    saveSessionToken('', false);
+    window.dispatchEvent(new CustomEvent('netbill:unauthorized'));
+  }
   if (!res.ok) {
     throw new Error((data as { error?: string }).error || 'সার্ভারে ত্রুটি হয়েছে।');
   }
@@ -237,7 +241,7 @@ export const api = {
     }),
 
   // Settings
-  updateSettings: (payload: Partial<SettingsData>) =>
+  updateSettings: (payload: Partial<SettingsData> & { CurrentAdminPassword?: string }) =>
     request<{ settings: Omit<SettingsData, 'AdminPassword'> }>('/api/settings', {
       method: 'PUT',
       body: JSON.stringify(payload),

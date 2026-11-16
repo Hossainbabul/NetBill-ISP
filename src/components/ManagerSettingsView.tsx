@@ -1102,9 +1102,10 @@ interface SettingsViewProps {
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({ data, onRefresh }) => {
-  const [form, setForm] = useState<Partial<SettingsData>>({
+  const [form, setForm] = useState<Partial<SettingsData> & { CurrentAdminPassword?: string }>({
     ...data.settings,
     AdminPassword: '',
+    CurrentAdminPassword: '',
   });
   const [saving, setSaving] = useState(false);
   const [savedMsg, setSavedMsg] = useState('');
@@ -1118,7 +1119,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ data, onRefresh }) =
     try {
       await api.updateSettings(form);
       setSavedMsg('সিস্টেম সেটিংস ও ই-বিলিং অ্যাকাউন্ট সফলভাবে সংরক্ষণ করা হয়েছে।');
-      setForm((prev) => ({ ...prev, AdminPassword: '' }));
+      setForm((prev) => ({ ...prev, AdminPassword: '', CurrentAdminPassword: '' }));
       await onRefresh();
     } catch (error) {
       setErr((error as Error).message);
@@ -1258,12 +1259,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ data, onRefresh }) =
               </label>
               <input
                 type="text"
+                minLength={16}
+                maxLength={128}
                 value={form.PaymentGatewayWebhookSecret || ''}
                 onChange={(e) =>
                   setForm({ ...form, PaymentGatewayWebhookSecret: e.target.value })
                 }
                 className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono-num text-sm"
               />
+              <p className="mt-1 text-[11px] text-slate-500">
+                কমপক্ষে ১৬ অক্ষরের গোপন কী ব্যবহার করুন
+              </p>
             </div>
           </div>
 
@@ -1458,29 +1464,52 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ data, onRefresh }) =
 
         <section className="rounded-xl border border-slate-200 bg-white p-5 space-y-4">
           <h2 className="text-lg font-bold text-slate-900">অ্যাডমিন নিরাপত্তা ও পাসওয়ার্ড</h2>
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
             <div>
               <label className="mb-1 block text-xs font-semibold text-slate-700">
                 অ্যাডমিন ইউজারনেম
               </label>
               <input
                 type="text"
+                pattern="^[A-Za-z0-9._-]{3,32}$"
                 value={form.AdminUsername || ''}
                 onChange={(e) => setForm({ ...form, AdminUsername: e.target.value })}
                 className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono-num text-sm"
               />
+              <p className="mt-1 text-[11px] text-slate-500">
+                ৩–৩২ অক্ষর (ইংরেজি অক্ষর, সংখ্যা, . _ -)
+              </p>
             </div>
             <div>
               <label className="mb-1 block text-xs font-semibold text-slate-700">
-                নতুন অ্যাডমিন পাসওয়ার্ড (পরিবর্তন করতে চাইলে লিখুন)
+                বর্তমান অ্যাডমিন পাসওয়ার্ড
               </label>
               <input
                 type="password"
-                value={form.AdminPassword || ''}
-                onChange={(e) => setForm({ ...form, AdminPassword: e.target.value })}
-                placeholder="অপরিবর্তিত রাখতে খালি রাখুন"
+                autoComplete="current-password"
+                required={Boolean(form.AdminPassword && form.AdminPassword.trim())}
+                value={form.CurrentAdminPassword || ''}
+                onChange={(e) => setForm({ ...form, CurrentAdminPassword: e.target.value })}
+                placeholder="পাসওয়ার্ড পরিবর্তন করতে চাইলে লিখুন"
                 className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
               />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-slate-700">
+                নতুন অ্যাডমিন পাসওয়ার্ড (ঐচ্ছিক)
+              </label>
+              <input
+                type="password"
+                autoComplete="new-password"
+                minLength={8}
+                value={form.AdminPassword || ''}
+                onChange={(e) => setForm({ ...form, AdminPassword: e.target.value })}
+                placeholder="অপরিবর্তিত রাখতে খালি রাখুন (৮+ অক্ষর)"
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              />
+              <p className="mt-1 text-[11px] text-slate-500">
+                কমপক্ষে ৮ অক্ষরের শক্তিশালী পাসওয়ার্ড দিন
+              </p>
             </div>
           </div>
 

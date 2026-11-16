@@ -45,6 +45,32 @@ interface DatabaseSchema {
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'netbill-db.json');
 
+const MIN_PASSWORD_LENGTH = 8;
+const USERNAME_RE = /^[A-Za-z0-9._-]{3,32}$/;
+const DEMO_WEBHOOK_SECRET = 'nb_whsec_demo_2026';
+const WEAK_PASSWORDS = new Set([
+  '1234',
+  '12345',
+  '123456',
+  '1234567',
+  '12345678',
+  '123456789',
+  '1234567890',
+  'admin',
+  'admin123',
+  'admin1234',
+  'administrator',
+  'password',
+  'password123',
+  'qwerty',
+  'qwerty123',
+  '00000000',
+  '11111111',
+  'letmein1',
+  'welcome1',
+  'netbill123',
+]);
+
 const BN_DIGITS = ['০', '১', '২', '৩', '৪', '৫', '৬', '৭', '৮', '৯'];
 const BN_MONTHS: Record<string, string> = {
   '01': 'জানুয়ারি',
@@ -103,8 +129,95 @@ function todayStr(): string {
 }
 
 function randomId(prefix: string): string {
-  const num = Math.floor(100000 + Math.random() * 900000);
+  const num = crypto.randomInt(100000, 1000000);
   return `${prefix}-${num}`;
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const hashA = crypto.createHash('sha256').update(String(a)).digest();
+  const hashB = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(hashA, hashB);
+}
+
+function isHashedPassword(stored: string | undefined): boolean {
+  if (!stored) return false;
+  const parts = stored.split('$');
+  return parts.length === 3 && parts[0] === 'scrypt' && parts[1].length >= 16 && parts[2].length === 128;
+}
+
+function hashPassword(plain: string): string {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(plain, salt, 64).toString('hex');
+  return `scrypt$${salt}$${derived}`;
+}
+
+function verifyPassword(plain: string | undefined, stored: string | undefined): boolean {
+  if (!plain || !stored) return false;
+  if (isHashedPassword(stored)) {
+    const [, salt, hexHash] = stored.split('$');
+    const derived = crypto.scryptSync(plain, salt, 64);
+    const expected = Buffer.from(hexHash, 'hex');
+    if (derived.length !== expected.length) return false;
+    return crypto.timingSafeEqual(derived, expected);
+  }
+  return safeEqual(plain, stored);
+}
+
+function isWeakPasswordValue(pwd: string): boolean {
+  const trimmed = pwd.trim();
+  if (trimmed.length < MIN_PASSWORD_LENGTH) return true;
+  if (WEAK_PASSWORDS.has(trimmed.toLowerCase())) return true;
+  if (/^(.)\1+$/.test(trimmed)) return true;
+  return false;
+}
+
+function assertStrongPassword(pwd: string, label = 'পাসওয়ার্ড'): string {
+  const raw = String(pwd || '');
+  if (raw.trim().length < MIN_PASSWORD_LENGTH || raw.length > 128) {
+    throw new Error(`${label} কমপক্ষে ${toBnDigits(MIN_PASSWORD_LENGTH)} অক্ষরের হতে হবে।`);
+  }
+  if (isWeakPasswordValue(raw)) {
+    throw new Error(`দয়া করে আরও শক্তিশালী ${label} ব্যবহার করুন (সহজ/সাধারণ পাসওয়ার্ড অনুমোদিত নয়)।`);
+  }
+  return raw;
+}
+
+function generateStrongPassword(): string {
+  return crypto.randomBytes(9).toString('base64url');
+}
+
+function generateWebhookSecret(): string {
+  return `nb_whsec_${crypto.randomBytes(18).toString('hex')}`;
+}
+
+function maskMobile(mobile: string): string {
+  const digits = String(mobile || '').replace(/\D/g, '');
+  if (digits.length < 6) return '***';
+  return `${digits.slice(0, 3)}******${digits.slice(-2)}`;
+}
+
+function maskTrx(trx: string): string {
+  const s = String(trx || '').trim();
+  if (!s) return '';
+  if (s.length <= 4) return '****';
+  return `${s.slice(0, 2)}${'*'.repeat(Math.min(8, s.length - 4))}${s.slice(-2)}`;
+}
+
+function normalizeMobileDigits(mobile: string): string {
+  const digits = String(mobile || '').replace(/\D/g, '');
+  if (digits.startsWith('8801') && digits.length === 13) {
+    return digits.slice(2);
+  }
+  return digits;
+}
+
+class DuplicateTrxError extends Error {
+  public existingReceipt?: Collection;
+  constructor(message: string, existingReceipt?: Collection) {
+    super(message);
+    this.name = 'DuplicateTrxError';
+    this.existingReceipt = existingReceipt;
+  }
 }
 
 function createSeedDatabase(): DatabaseSchema {
@@ -117,7 +230,7 @@ function createSeedDatabase(): DatabaseSchema {
       ScrollingNotice:
         'সম্মানিত গ্রাহকগণ, প্রতি মাসের ১০ তারিখের মধ্যে আপনার ইন্টারনেট ও ডিস বিল বিকাশ/নগদ/রকেট বা অনলাইন পেমেন্ট পোর্টালের মাধ্যমে পরিশোধ করুন। সহায়তার জন্য কল করুন: ০১৭১১-২২৩৩৪৪।',
       AdminUsername: 'admin',
-      AdminPassword: 'admin123',
+      AdminPassword: '',
       BkashNumber: '01711-223344',
       BkashType: 'Merchant',
       NagadNumber: '01811-556677',
@@ -130,7 +243,7 @@ function createSeedDatabase(): DatabaseSchema {
         Branch: 'মিরপুর শাখা, ঢাকা',
         Routing: '090262987',
       },
-      PaymentGatewayWebhookSecret: 'nb_whsec_demo_2026',
+      PaymentGatewayWebhookSecret: '',
       SmsConfig: {
         Enabled: true,
         Provider: (process.env.SMS_PROVIDER as SmsProvider) || 'sandbox',
@@ -151,7 +264,7 @@ function createSeedDatabase(): DatabaseSchema {
         Name: 'মোঃ রফিকুল ইসলাম',
         Mobile: '01712-345678',
         Username: 'rafiq',
-        Password: '1234',
+        Password: '',
         AssignedAreas: ['মিরপুর ১০ (সেক্টর এ)', 'কাজীপাড়া উত্তর'],
         Status: 'এক্টিভ',
         CreatedAt: '2026-01-15',
@@ -161,7 +274,7 @@ function createSeedDatabase(): DatabaseSchema {
         Name: 'সোহেল রানা',
         Mobile: '01819-876543',
         Username: 'sohel',
-        Password: '1234',
+        Password: '',
         AssignedAreas: ['শেওড়াপাড়া বাজার', 'পল্লবী আবাসিক'],
         Status: 'এক্টিভ',
         CreatedAt: '2026-02-18',
@@ -330,32 +443,22 @@ function createSeedDatabase(): DatabaseSchema {
       },
     ],
     bills: [
-      // October & November 2026 bills + Opening
       { BillID: 'BL-9001', CustomerID: 'NB-1001', BillingMonth: '2026-10', MonthLabel: 'অক্টোবর ২০২৬', BillType: 'Monthly', Amount: 1000, PaidAmount: 1000, DueAmount: 0, Status: 'পরিশোধিত', GeneratedDate: '2026-10-01' },
       { BillID: 'BL-9002', CustomerID: 'NB-1001', BillingMonth: '2026-11', MonthLabel: 'নভেম্বর ২০২৬', BillType: 'Monthly', Amount: 1000, PaidAmount: 1000, DueAmount: 0, Status: 'পরিশোধিত', GeneratedDate: '2026-11-01' },
-
       { BillID: 'BL-9003', CustomerID: 'NB-1002', BillingMonth: '2026-10', MonthLabel: 'অক্টোবর ২০২৬', BillType: 'Monthly', Amount: 800, PaidAmount: 800, DueAmount: 0, Status: 'পরিশোধিত', GeneratedDate: '2026-10-01' },
       { BillID: 'BL-9004', CustomerID: 'NB-1002', BillingMonth: '2026-11', MonthLabel: 'নভেম্বর ২০২৬', BillType: 'Monthly', Amount: 800, PaidAmount: 0, DueAmount: 800, Status: 'বকেয়া', GeneratedDate: '2026-11-01' },
-
       { BillID: 'BL-9005', CustomerID: 'NB-1003', BillingMonth: 'Opening', MonthLabel: 'পূর্বের বকেয়া', BillType: 'Opening', Amount: 500, PaidAmount: 0, DueAmount: 500, Status: 'বকেয়া', GeneratedDate: '2026-06-01' },
       { BillID: 'BL-9006', CustomerID: 'NB-1003', BillingMonth: '2026-10', MonthLabel: 'অক্টোবর ২০২৬', BillType: 'Monthly', Amount: 1500, PaidAmount: 1500, DueAmount: 0, Status: 'পরিশোধিত', GeneratedDate: '2026-10-01' },
       { BillID: 'BL-9007', CustomerID: 'NB-1003', BillingMonth: '2026-11', MonthLabel: 'নভেম্বর ২০২৬', BillType: 'Monthly', Amount: 1500, PaidAmount: 500, DueAmount: 1000, Status: 'আংশিক', GeneratedDate: '2026-11-01' },
-
       { BillID: 'BL-9008', CustomerID: 'NB-1004', BillingMonth: '2026-10', MonthLabel: 'অক্টোবর ২০২৬', BillType: 'Monthly', Amount: 500, PaidAmount: 0, DueAmount: 500, Status: 'বকেয়া', GeneratedDate: '2026-10-01' },
-
       { BillID: 'BL-9009', CustomerID: 'NB-1005', BillingMonth: '2026-11', MonthLabel: 'নভেম্বর ২০২৬', BillType: 'Monthly', Amount: 900, PaidAmount: 900, DueAmount: 0, Status: 'পরিশোধিত', GeneratedDate: '2026-11-01' },
-
       { BillID: 'BL-9010', CustomerID: 'NB-1006', BillingMonth: '2026-11', MonthLabel: 'নভেম্বর ২০২৬', BillType: 'Monthly', Amount: 400, PaidAmount: 0, DueAmount: 400, Status: 'বকেয়া', GeneratedDate: '2026-11-01' },
-
       { BillID: 'BL-9011', CustomerID: 'NB-1007', BillingMonth: '2026-10', MonthLabel: 'অক্টোবর ২০২৬', BillType: 'Monthly', Amount: 300, PaidAmount: 300, DueAmount: 0, Status: 'পরিশোধিত', GeneratedDate: '2026-10-01' },
       { BillID: 'BL-9012', CustomerID: 'NB-1007', BillingMonth: '2026-11', MonthLabel: 'নভেম্বর ২০২৬', BillType: 'Monthly', Amount: 300, PaidAmount: 0, DueAmount: 300, Status: 'বকেয়া', GeneratedDate: '2026-11-01' },
-
       { BillID: 'BL-9013', CustomerID: 'NB-1008', BillingMonth: '2026-11', MonthLabel: 'নভেম্বর ২০২৬', BillType: 'Monthly', Amount: 2500, PaidAmount: 2500, DueAmount: 0, Status: 'পরিশোধিত', GeneratedDate: '2026-11-01' },
-
       { BillID: 'BL-9014', CustomerID: 'NB-1010', BillingMonth: '2026-10', MonthLabel: 'অক্টোবর ২০২৬', BillType: 'Monthly', Amount: 1200, PaidAmount: 1200, DueAmount: 0, Status: 'পরিশোধিত', GeneratedDate: '2026-10-01' },
     ],
     collections: [
-      // Past 6 months collections (June 2026 - November 2026)
       { ReceiptID: 'P-601011', Date: '2026-06-12', CustomerID: 'NB-1001', CustomerName: 'মোঃ কামাল হোসেন', Area: 'মিরপুর ১০ (সেক্টর এ)', BillingMonth: '2026-06', Amount: 1000, PaymentMethod: 'Cash', TrxID: '', SenderAccount: '', CollectedBy: 'rafiq', CollectorRole: 'User', Note: 'জুন বিল', CreatedAt: '2026-06-12T11:00:00Z' },
       { ReceiptID: 'P-601012', Date: '2026-06-14', CustomerID: 'NB-1008', CustomerName: 'তানভীর হাসান', Area: 'মিরপুর ১০ (সেক্টর এ)', BillingMonth: '2026-06', Amount: 2500, PaymentMethod: 'Bank', TrxID: 'DBBL-884210', SenderAccount: '110-220-334', CollectedBy: 'admin', CollectorRole: 'Admin', Note: '', CreatedAt: '2026-06-14T14:20:00Z' },
       { ReceiptID: 'P-601013', Date: '2026-07-09', CustomerID: 'NB-1001', CustomerName: 'মোঃ কামাল হোসেন', Area: 'মিরপুর ১০ (সেক্টর এ)', BillingMonth: '2026-07', Amount: 1000, PaymentMethod: 'bKash', TrxID: 'BK7X29M1P', SenderAccount: '01715-112233', CollectedBy: 'Self-EBill', CollectorRole: 'Self-EBill', Note: '', CreatedAt: '2026-07-09T10:15:00Z' },
@@ -529,7 +632,165 @@ function withLock<T>(fn: () => Promise<T> | T): Promise<T> {
   return next;
 }
 
-const sessions = new Map<string, SessionUser>();
+function hardenCredentials(): void {
+  const db = ensureDb();
+  let changed = false;
+  const notices: string[] = [];
+
+  const envAdminPwd = (process.env.ADMIN_PASSWORD || '').trim();
+  const forceReset = process.env.RESET_ADMIN_PASSWORD === '1';
+
+  if (forceReset && envAdminPwd) {
+    assertStrongPassword(envAdminPwd, 'ADMIN_PASSWORD');
+    db.settings.AdminPassword = hashPassword(envAdminPwd);
+    changed = true;
+    notices.push(`[SECURITY] Admin password reset from ADMIN_PASSWORD for "${db.settings.AdminUsername}".`);
+  } else if (!db.settings.AdminPassword || (!isHashedPassword(db.settings.AdminPassword) && isWeakPasswordValue(db.settings.AdminPassword))) {
+    if (envAdminPwd && !isWeakPasswordValue(envAdminPwd)) {
+      db.settings.AdminPassword = hashPassword(envAdminPwd);
+      notices.push(`[SECURITY] Initialized Admin password from ADMIN_PASSWORD for "${db.settings.AdminUsername}".`);
+    } else {
+      const generated = generateStrongPassword();
+      db.settings.AdminPassword = hashPassword(generated);
+      notices.push(`[SECURITY] Generated Admin password for "${db.settings.AdminUsername}": ${generated}`);
+    }
+    changed = true;
+  } else if (!isHashedPassword(db.settings.AdminPassword)) {
+    db.settings.AdminPassword = hashPassword(db.settings.AdminPassword);
+    changed = true;
+  }
+
+  for (const col of db.collectors) {
+    if (!col.Password || (!isHashedPassword(col.Password) && isWeakPasswordValue(col.Password))) {
+      const generated = generateStrongPassword();
+      col.Password = hashPassword(generated);
+      changed = true;
+      notices.push(`[SECURITY] Generated password for collector "${col.Username}": ${generated}`);
+    } else if (!isHashedPassword(col.Password)) {
+      col.Password = hashPassword(col.Password);
+      changed = true;
+    }
+  }
+
+  if (
+    !db.settings.PaymentGatewayWebhookSecret ||
+    db.settings.PaymentGatewayWebhookSecret === DEMO_WEBHOOK_SECRET ||
+    db.settings.PaymentGatewayWebhookSecret.length < 16
+  ) {
+    const newSecret = generateWebhookSecret();
+    db.settings.PaymentGatewayWebhookSecret = newSecret;
+    changed = true;
+    notices.push(`[SECURITY] Generated PaymentGatewayWebhookSecret: ${newSecret}`);
+  }
+
+  if (changed) {
+    writeDbAtomic(db);
+  }
+  for (const msg of notices) {
+    console.log(msg);
+  }
+}
+
+// Session store with idle & absolute timeout + revocation
+interface SessionRecord {
+  user: SessionUser;
+  createdAt: number;
+  lastActiveAt: number;
+}
+
+const sessions = new Map<string, SessionRecord>();
+const IDLE_HOURS_RAW = Number(process.env.SESSION_IDLE_HOURS || 12);
+const SESSION_IDLE_MS = (Number.isFinite(IDLE_HOURS_RAW) && IDLE_HOURS_RAW > 0 ? IDLE_HOURS_RAW : 12) * 3600 * 1000;
+const SESSION_ABSOLUTE_MS = 7 * 24 * 3600 * 1000;
+
+function pruneExpiredSessions(now = Date.now()): void {
+  for (const [token, rec] of sessions.entries()) {
+    if (now - rec.lastActiveAt > SESSION_IDLE_MS || now - rec.createdAt > SESSION_ABSOLUTE_MS) {
+      sessions.delete(token);
+    }
+  }
+}
+
+function createSession(user: SessionUser): SessionUser {
+  const now = Date.now();
+  pruneExpiredSessions(now);
+  sessions.set(user.token, { user, createdAt: now, lastActiveAt: now });
+  return user;
+}
+
+function destroySession(token: string): void {
+  sessions.delete(token);
+}
+
+function revokeSessionsFor(role: 'Admin' | 'User', username?: string, exceptToken?: string): void {
+  for (const [token, rec] of sessions.entries()) {
+    if (exceptToken && token === exceptToken) continue;
+    if (rec.user.role === role && (!username || rec.user.username === username)) {
+      sessions.delete(token);
+    }
+  }
+}
+
+// In-memory Rate Limiter
+interface RateBucket {
+  count: number;
+  resetAt: number;
+}
+const rateBuckets = new Map<string, RateBucket>();
+
+function getClientIp(req: Request): string {
+  return req.ip || req.socket.remoteAddress || 'unknown';
+}
+
+function rateCheck(key: string, limit: number, windowMs: number): { allowed: boolean; retryAfterSec: number } {
+  const now = Date.now();
+  const existing = rateBuckets.get(key);
+  if (!existing || now >= existing.resetAt) {
+    return { allowed: true, retryAfterSec: 0 };
+  }
+  if (existing.count >= limit) {
+    return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((existing.resetAt - now) / 1000)) };
+  }
+  return { allowed: true, retryAfterSec: 0 };
+}
+
+function rateHit(key: string, limit: number, windowMs: number): { allowed: boolean; retryAfterSec: number } {
+  const now = Date.now();
+  if (rateBuckets.size > 5000) {
+    for (const [k, b] of rateBuckets.entries()) {
+      if (now >= b.resetAt) rateBuckets.delete(k);
+    }
+  }
+  let bucket = rateBuckets.get(key);
+  if (!bucket || now >= bucket.resetAt) {
+    bucket = { count: 0, resetAt: now + windowMs };
+    rateBuckets.set(key, bucket);
+  }
+  bucket.count += 1;
+  if (bucket.count > limit) {
+    return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((bucket.resetAt - now) / 1000)) };
+  }
+  return { allowed: true, retryAfterSec: 0 };
+}
+
+function rateReset(key: string): void {
+  rateBuckets.delete(key);
+}
+
+function rateLimit(prefix: string, limit: number, windowMs: number, keyFn?: (req: Request) => string) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const id = keyFn ? keyFn(req) : getClientIp(req);
+    const result = rateHit(`${prefix}:${id}`, limit, windowMs);
+    if (!result.allowed) {
+      res.setHeader('Retry-After', String(result.retryAfterSec));
+      res.status(429).json({
+        error: `অতিরিক্ত অনুরোধ পাঠানো হয়েছে। অনুগ্রহ করে ${toBnDigits(result.retryAfterSec)} সেকেন্ড পর আবার চেষ্টা করুন।`,
+      });
+      return;
+    }
+    next();
+  };
+}
 
 function computeCollectorSummaries(db: DatabaseSchema): CollectorSummary[] {
   return db.collectors.map((col) => {
@@ -573,14 +834,11 @@ function computeAccountBalances(db: DatabaseSchema): AccountBalances {
 
   for (const col of db.collections) {
     if (col.PaymentMethod === 'Cash') {
-      // Only Admin direct Cash collections go immediately into Admin Office Cash.
-      // Collector Cash stays in Collector Hand Cash until deposited!
       if (col.CollectorRole === 'Admin') {
         accounts.Cash += col.Amount;
         totalIncome += col.Amount;
       }
     } else {
-      // Digital payments (bKash, Nagad, Rocket, Bank) go directly to Company Digital Accounts
       accounts[col.PaymentMethod] += col.Amount;
       totalIncome += col.Amount;
     }
@@ -632,8 +890,23 @@ function collectBillInternal(db: DatabaseSchema, params: CollectBillParams): Col
     throw new Error('টাকার পরিমাণ অবশ্যই ০ এর বেশি হতে হবে।');
   }
 
-  if (params.paymentMethod !== 'Cash' && !params.trxId.trim()) {
+  const trimmedTrx = (params.trxId || '').trim();
+  if (params.paymentMethod !== 'Cash' && !trimmedTrx) {
     throw new Error('ডিজিটাল পেমেন্টের জন্য TrxID / রেফারেন্স নম্বর আবশ্যক।');
+  }
+
+  if (params.paymentMethod !== 'Cash' && trimmedTrx) {
+    const existingReceipt = db.collections.find(
+      (c) =>
+        c.PaymentMethod === params.paymentMethod &&
+        c.TrxID.trim().toLowerCase() === trimmedTrx.toLowerCase()
+    );
+    if (existingReceipt) {
+      throw new DuplicateTrxError(
+        `এই TrxID (${trimmedTrx}) দিয়ে ইতিমধ্যেই রিসিট ${existingReceipt.ReceiptID} সংরক্ষিত হয়েছে।`,
+        existingReceipt
+      );
+    }
   }
 
   const targetMonth = params.billingMonth || todayStr().slice(0, 7);
@@ -736,11 +1009,11 @@ function collectBillInternal(db: DatabaseSchema, params: CollectBillParams): Col
     BillingMonth: targetMonth,
     Amount: amount,
     PaymentMethod: params.paymentMethod,
-    TrxID: params.trxId.trim(),
-    SenderAccount: params.senderAccount.trim(),
+    TrxID: trimmedTrx,
+    SenderAccount: (params.senderAccount || '').trim(),
     CollectedBy: params.collectedBy,
     CollectorRole: params.collectorRole,
-    Note: params.note.trim(),
+    Note: (params.note || '').trim(),
     CreatedAt: new Date().toISOString(),
   };
 
@@ -755,11 +1028,41 @@ interface AuthedRequest extends Request {
 function authMiddleware(req: AuthedRequest, res: Response, next: NextFunction) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
-  if (!token || !sessions.has(token)) {
+  const now = Date.now();
+  const record = token ? sessions.get(token) : undefined;
+
+  if (!token || !record) {
     res.status(401).json({ error: 'সেশন মেয়াদোত্তীর্ণ হয়েছে, অনুগ্রহ করে পুনরায় লগইন করুন।' });
     return;
   }
-  req.user = sessions.get(token);
+
+  if (now - record.lastActiveAt > SESSION_IDLE_MS || now - record.createdAt > SESSION_ABSOLUTE_MS) {
+    destroySession(token);
+    res.status(401).json({ error: 'সেশনের সময়সীমা শেষ হয়েছে, অনুগ্রহ করে পুনরায় লগইন করুন।' });
+    return;
+  }
+
+  const db = ensureDb();
+  if (record.user.role === 'User') {
+    const col = db.collectors.find((c) => c.Username === record.user.username);
+    if (!col || col.Status !== 'এক্টিভ') {
+      destroySession(token);
+      res.status(401).json({ error: 'আপনার অ্যাকাউন্ট নিষ্ক্রিয় করা হয়েছে।' });
+      return;
+    }
+    record.user = {
+      ...record.user,
+      name: col.Name,
+      assignedAreas: col.AssignedAreas,
+    };
+  } else if (record.user.username !== db.settings.AdminUsername) {
+    destroySession(token);
+    res.status(401).json({ error: 'সেশন বৈধ নয়, অনুগ্রহ করে পুনরায় লগইন করুন।' });
+    return;
+  }
+
+  record.lastActiveAt = now;
+  req.user = record.user;
   next();
 }
 
@@ -772,7 +1075,7 @@ function requireAdmin(req: AuthedRequest, res: Response, next: NextFunction) {
 }
 
 function verifyAdminPassword(db: DatabaseSchema, password: string | undefined): boolean {
-  return Boolean(password && password === db.settings.AdminPassword);
+  return verifyPassword(password, db.settings.AdminPassword);
 }
 
 async function persistSmsLog(logEntry: SmsLog): Promise<void> {
@@ -786,11 +1089,6 @@ async function persistSmsLog(logEntry: SmsLog): Promise<void> {
   });
 }
 
-/**
- * Unified backend payment processor for the 'Collections' store.
- * Atomically records the receipt + reconciles bills, then automatically triggers
- * `onCollectionPaymentProcessed` to format and dispatch the Bengali confirmation SMS.
- */
 async function processCollectionPayment(options: {
   prepareAndValidate?: (db: DatabaseSchema) => {
     params: CollectBillParams;
@@ -833,20 +1131,107 @@ async function processCollectionPayment(options: {
   return { receipt: committed.receipt, smsLog };
 }
 
+function daysBetweenDates(dateA: string, dateB: string): number {
+  const a = Date.parse(`${dateA}T00:00:00Z`);
+  const b = Date.parse(`${dateB}T00:00:00Z`);
+  if (Number.isNaN(a) || Number.isNaN(b)) return Number.NaN;
+  return Math.round((a - b) / (24 * 3600 * 1000));
+}
+
+const BLOCKED_PATH_PATTERNS = [
+  /^\/data(?:\/|$)/i,
+  /^\/server(?:\/|$)/i,
+  /^\/@fs(?:\/|$)/i,
+  /^\/\.env/i,
+  /^\/\.git/i,
+  /^\/server\.ts$/i,
+  /^\/package(?:-lock)?\.json$/i,
+  /^\/bun\.lock$/i,
+  /^\/tsconfig\.json$/i,
+  /^\/vite\.config\.ts$/i,
+  /^\/metadata\.json$/i,
+];
+
 async function startServer() {
   ensureDb();
-  const app = express();
-  app.use(express.json({ limit: '2mb' }));
+  hardenCredentials();
 
-  // Public Auth
+  const app = express();
+  const isProd = process.env.NODE_ENV === 'production' || process.argv.includes('--prod');
+
+  if (process.env.TRUST_PROXY === '1') {
+    app.set('trust proxy', 1);
+  }
+
+  // Optional HTTPS Enforcement
+  if (process.env.FORCE_HTTPS === '1') {
+    app.use((req, res, next) => {
+      const proto = req.headers['x-forwarded-proto'];
+      if (!req.secure && proto !== 'https') {
+        res.redirect(301, `https://${req.headers.host}${req.originalUrl}`);
+        return;
+      }
+      next();
+    });
+  }
+
+  // Security Headers
+  app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    if (process.env.BLOCK_FRAMING === '1') {
+      res.setHeader('X-Frame-Options', 'DENY');
+      res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
+    }
+    if (req.path.startsWith('/api/')) {
+      res.setHeader('Cache-Control', 'no-store');
+    }
+    next();
+  });
+
+  // Block direct access to internal files, database directory, and source configs
+  app.use((req, res, next) => {
+    const cleanPath = req.path || '/';
+    if (BLOCKED_PATH_PATTERNS.some((re) => re.test(cleanPath))) {
+      res.status(404).end();
+      return;
+    }
+    next();
+  });
+
+  app.use(express.json({ limit: '512kb' }));
+
+  // Public Auth with Rate Limiting
   app.post('/api/auth/login', async (req, res) => {
+    const ip = getClientIp(req);
+    const ipCheck = rateCheck(`login-ip:${ip}`, 20, 15 * 60 * 1000);
+    if (!ipCheck.allowed) {
+      res.setHeader('Retry-After', String(ipCheck.retryAfterSec));
+      res.status(429).json({
+        error: `অতিরিক্ত লগইন প্রচেষ্টা করা হয়েছে। ${toBnDigits(ipCheck.retryAfterSec)} সেকেন্ড পর চেষ্টা করুন।`,
+      });
+      return;
+    }
+
     const { username, password } = req.body as { username?: string; password?: string };
     const u = (username || '').trim();
     const p = password || '';
-    const db = ensureDb();
+    const userIpKey = `login-user-ip:${u.toLowerCase()}:${ip}`;
 
+    const userIpCheck = rateCheck(userIpKey, 5, 15 * 60 * 1000);
+    if (!userIpCheck.allowed) {
+      res.setHeader('Retry-After', String(userIpCheck.retryAfterSec));
+      res.status(429).json({
+        error: `ভুল পাসওয়ার্ডের কারণে সাময়িকভাবে ব্লক করা হয়েছে। ${toBnDigits(userIpCheck.retryAfterSec)} সেকেন্ড পর চেষ্টা করুন।`,
+      });
+      return;
+    }
+
+    const db = ensureDb();
     let sessionUser: SessionUser | null = null;
-    if (u === db.settings.AdminUsername && p === db.settings.AdminPassword) {
+
+    if (u === db.settings.AdminUsername && verifyPassword(p, db.settings.AdminPassword)) {
       sessionUser = {
         token: crypto.randomUUID(),
         role: 'Admin',
@@ -856,7 +1241,7 @@ async function startServer() {
       };
     } else {
       const col = db.collectors.find(
-        (c) => c.Username === u && c.Password === p && c.Status === 'এক্টিভ'
+        (c) => c.Username === u && c.Status === 'এক্টিভ' && verifyPassword(p, c.Password)
       );
       if (col) {
         sessionUser = {
@@ -869,12 +1254,16 @@ async function startServer() {
       }
     }
 
+    rateHit(`login-ip:${ip}`, 20, 15 * 60 * 1000);
+
     if (!sessionUser) {
+      rateHit(userIpKey, 5, 15 * 60 * 1000);
       res.status(401).json({ error: 'ভুল ইউজারনেম অথবা পাসওয়ার্ড। অনুগ্রহ করে আবার চেষ্টা করুন।' });
       return;
     }
 
-    sessions.set(sessionUser.token, sessionUser);
+    rateReset(userIpKey);
+    createSession(sessionUser);
     res.json({ user: sessionUser });
   });
 
@@ -884,14 +1273,25 @@ async function startServer() {
 
   app.post('/api/auth/logout', authMiddleware, (req: AuthedRequest, res) => {
     if (req.user?.token) {
-      sessions.delete(req.user.token);
+      destroySession(req.user.token);
     }
     res.json({ ok: true });
   });
 
-  // Public E-Billing Portal Endpoints (No Login Required)
-  app.get('/api/public/lookup', (req, res) => {
-    const q = String(req.query.q || '').trim().toLowerCase();
+  // Public E-Billing Portal Endpoints (Exact lookup + Data masking + Rate limited)
+  app.get('/api/public/lookup', rateLimit('public-lookup', 40, 60 * 1000), (req, res) => {
+    const ip = getClientIp(req);
+    const missCheck = rateCheck(`lookup-miss:${ip}`, 10, 10 * 60 * 1000);
+    if (!missCheck.allowed) {
+      res.setHeader('Retry-After', String(missCheck.retryAfterSec));
+      res.status(429).json({
+        error: `অনেকবার ভুল তথ্য দিয়ে খোঁজা হয়েছে। ${toBnDigits(missCheck.retryAfterSec)} সেকেন্ড পর আবার চেষ্টা করুন।`,
+      });
+      return;
+    }
+
+    const q = String(req.query.q || '').trim();
+    const qLower = q.toLowerCase();
     const db = ensureDb();
     const {
       CompanyName,
@@ -931,16 +1331,16 @@ async function startServer() {
       return;
     }
 
-    const normalizedDigits = q.replace(/\D/g, '');
+    const qDigits = normalizeMobileDigits(q);
     const customer =
       db.customers.find(
         (c) =>
-          c.CustomerID.toLowerCase() === q ||
-          c.Mobile.toLowerCase() === q ||
-          (normalizedDigits.length >= 6 && c.Mobile.replace(/\D/g, '').endsWith(normalizedDigits))
+          c.CustomerID.toLowerCase() === qLower ||
+          (qDigits.length >= 10 && normalizeMobileDigits(c.Mobile) === qDigits)
       ) || null;
 
     if (!customer) {
+      rateHit(`lookup-miss:${ip}`, 10, 10 * 60 * 1000);
       res.json({
         company,
         customer: null,
@@ -952,19 +1352,46 @@ async function startServer() {
       return;
     }
 
+    rateReset(`lookup-miss:${ip}`);
+
+    const maskedCustomer: Customer = {
+      ...customer,
+      Mobile: maskMobile(customer.Mobile),
+      Address: '',
+      Note: '',
+      OpeningBalance: 0,
+    };
+
     const dueBills = db.bills.filter(
       (b) => b.CustomerID === customer.CustomerID && b.DueAmount > 0
     );
     const totalDue = dueBills.reduce((s, b) => s + b.DueAmount, 0);
-    const lastPayment =
+
+    const rawLastPayment =
       db.collections.find((c) => c.CustomerID === customer.CustomerID) || null;
+    const lastPayment = rawLastPayment
+      ? {
+          ...rawLastPayment,
+          TrxID: maskTrx(rawLastPayment.TrxID),
+          SenderAccount: '',
+          CollectedBy: '',
+          Note: '',
+        }
+      : null;
+
     const recentRequests = db.ePayments
       .filter((e) => e.CustomerID === customer.CustomerID)
-      .slice(0, 5);
+      .slice(0, 5)
+      .map((r) => ({
+        ...r,
+        Mobile: maskMobile(r.Mobile),
+        SenderNumberOrAccount: maskMobile(r.SenderNumberOrAccount),
+        TrxID: maskTrx(r.TrxID),
+      }));
 
     res.json({
       company,
-      customer,
+      customer: maskedCustomer,
       dueBills,
       totalDue,
       lastPayment,
@@ -972,7 +1399,7 @@ async function startServer() {
     });
   });
 
-  app.post('/api/public/epayment', async (req, res) => {
+  app.post('/api/public/epayment', rateLimit('public-epay', 8, 10 * 60 * 1000), async (req, res) => {
     try {
       const result = await withLock(() => {
         const db = ensureDb();
@@ -996,8 +1423,28 @@ async function startServer() {
 
         const customer = db.customers.find((c) => c.CustomerID === customerId);
         if (!customer) throw new Error('সঠিক গ্রাহক আইডি পাওয়া যায়নি।');
-        if (!amount || Number(amount) <= 0) throw new Error('সঠিক টাকার পরিমাণ লিখুন।');
-        if (!senderNumberOrAccount?.trim()) throw new Error('প্রেরকের নম্বর বা অ্যাকাউন্ট নম্বর লিখুন।');
+
+        const pendingForCust = db.ePayments.filter(
+          (e) => e.CustomerID === customer.CustomerID && e.Status === 'Pending'
+        ).length;
+        if (pendingForCust >= 5) {
+          throw new Error(
+            'এই গ্রাহকের ইতিমধ্যেই ৫টি অপেক্ষমাণ ই-পেমেন্ট অনুরোধ রয়েছে। অনুগ্রহ করে অফিস যাচাইয়ের জন্য অপেক্ষা করুন।'
+          );
+        }
+
+        const allowedDigital: Exclude<PaymentMethod, 'Cash'>[] = ['bKash', 'Nagad', 'Rocket', 'Bank'];
+        if (!allowedDigital.includes(paymentMethod)) {
+          throw new Error('সঠিক ডিজিটাল পেমেন্ট মাধ্যম নির্বাচন করুন।');
+        }
+
+        const numAmt = Number(amount);
+        if (!Number.isFinite(numAmt) || numAmt <= 0 || numAmt > 500000) {
+          throw new Error('সঠিক টাকার পরিমাণ লিখুন।');
+        }
+        if (!senderNumberOrAccount?.trim() || senderNumberOrAccount.includes('*')) {
+          throw new Error('প্রেরকের সঠিক মোবাইল বা ব্যাংক অ্যাকাউন্ট নম্বর লিখুন।');
+        }
         if (!trxId?.trim()) throw new Error('TrxID বা রেফারেন্স নম্বর আবশ্যক।');
 
         const dupTrx = db.ePayments.find(
@@ -1014,19 +1461,23 @@ async function startServer() {
           CustomerName: customer.Name,
           Mobile: customer.Mobile,
           BillingMonth: billingMonth || todayStr().slice(0, 7),
-          Amount: Number(amount),
+          Amount: numAmt,
           PaymentMethod: paymentMethod,
           SenderNumberOrAccount: senderNumberOrAccount.trim(),
           TrxID: trxId.trim(),
           Status: 'Pending',
           ReviewedBy: '',
           ReviewedAt: '',
-          Note: (note || '').trim(),
+          Note: (note || '').trim().slice(0, 200),
         };
 
         db.ePayments.unshift(reqRow);
         writeDbAtomic(db);
-        return reqRow;
+
+        return {
+          ...reqRow,
+          Mobile: maskMobile(reqRow.Mobile),
+        };
       });
       res.json({ request: result });
     } catch (err) {
@@ -1034,15 +1485,37 @@ async function startServer() {
     }
   });
 
-  // Automated Payment Gateway IPN / Webhook Hook
+  // Automated Payment Gateway IPN / Webhook Hook (Timing-safe + Rate-limited + Idempotent)
   app.post('/api/webhook/epayment', async (req, res) => {
+    const ip = getClientIp(req);
+    const failCheck = rateCheck(`webhook-fail:${ip}`, 10, 15 * 60 * 1000);
+    if (!failCheck.allowed) {
+      res.setHeader('Retry-After', String(failCheck.retryAfterSec));
+      res.status(429).json({ error: 'Too many failed webhook attempts' });
+      return;
+    }
+
+    const secret = String(req.headers['x-webhook-secret'] || req.body?.secret || '');
+    const dbSnap = ensureDb();
+    const storedSecret = dbSnap.settings.PaymentGatewayWebhookSecret || '';
+
+    if (
+      !storedSecret ||
+      storedSecret.length < 16 ||
+      storedSecret === DEMO_WEBHOOK_SECRET ||
+      !secret ||
+      !safeEqual(secret, storedSecret)
+    ) {
+      rateHit(`webhook-fail:${ip}`, 10, 15 * 60 * 1000);
+      res.status(401).json({ error: 'Invalid webhook secret' });
+      return;
+    }
+
+    rateReset(`webhook-fail:${ip}`);
+
     try {
-      const secret = String(req.headers['x-webhook-secret'] || req.body?.secret || '');
       const { receipt, smsLog } = await processCollectionPayment({
         prepareAndValidate: (db) => {
-          if (secret !== db.settings.PaymentGatewayWebhookSecret) {
-            throw new Error('Invalid webhook secret');
-          }
           const { customerId, trxId, amount, paymentMethod, senderAccount, billingMonth } = req.body;
           const pending = db.ePayments.find(
             (e) =>
@@ -1075,6 +1548,10 @@ async function startServer() {
 
       res.json({ ok: true, receipt, smsLog });
     } catch (err) {
+      if (err instanceof DuplicateTrxError) {
+        res.json({ ok: true, duplicate: true, receipt: err.existingReceipt });
+        return;
+      }
       res.status(400).json({ error: (err as Error).message });
     }
   });
@@ -1105,7 +1582,13 @@ async function startServer() {
       return;
     }
 
-    // Collector (User) strictly scoped to AssignedAreas
+    // Collector (User): omit AdminUsername & PaymentGatewayWebhookSecret
+    const collectorSafeSettings = {
+      ...safeSettings,
+      AdminUsername: '',
+      PaymentGatewayWebhookSecret: '',
+    };
+
     const allowedSet = new Set(user.assignedAreas);
     const scopedCustomers = db.customers.filter((c) => allowedSet.has(c.Area));
     const scopedCustIds = new Set(scopedCustomers.map((c) => c.CustomerID));
@@ -1120,7 +1603,7 @@ async function startServer() {
     );
 
     res.json({
-      settings: safeSettings,
+      settings: collectorSafeSettings,
       areas: db.areas.filter((a) => allowedSet.has(a.AreaName)),
       collectors: [],
       customers: scopedCustomers,
@@ -1223,12 +1706,17 @@ async function startServer() {
       const col = await withLock(() => {
         const db = ensureDb();
         const { Name, Mobile, Username, Password, AssignedAreas, Status } = req.body;
-        if (!Name?.trim() || !Username?.trim() || !Password?.trim()) {
+        const uname = String(Username || '').trim();
+        if (!Name?.trim() || !uname || !Password) {
           throw new Error('নাম, ইউজারনেম এবং পাসওয়ার্ড আবশ্যক।');
         }
+        if (!USERNAME_RE.test(uname)) {
+          throw new Error('ইউজারনেম ৩ থেকে ৩২ অক্ষরের ইংরেজি অক্ষর, সংখ্যা বা . _ - হতে হবে।');
+        }
+        const strongPwd = assertStrongPassword(String(Password), 'কালেক্টর পাসওয়ার্ড');
         if (
-          Username.trim() === db.settings.AdminUsername ||
-          db.collectors.some((c) => c.Username === Username.trim())
+          uname === db.settings.AdminUsername ||
+          db.collectors.some((c) => c.Username.toLowerCase() === uname.toLowerCase())
         ) {
           throw new Error('এই ইউজারনেমটি ইতিমধ্যেই ব্যবহৃত হয়েছে।');
         }
@@ -1236,15 +1724,15 @@ async function startServer() {
           CollectorID: randomId('CL'),
           Name: Name.trim(),
           Mobile: (Mobile || '').trim(),
-          Username: Username.trim(),
-          Password: Password.trim(),
+          Username: uname,
+          Password: hashPassword(strongPwd),
           AssignedAreas: Array.isArray(AssignedAreas) ? AssignedAreas : [],
           Status: Status || 'এক্টিভ',
           CreatedAt: todayStr(),
         };
         db.collectors.push(row);
         writeDbAtomic(db);
-        return row;
+        return { ...row, Password: '••••••' };
       });
       res.json({ collector: col });
     } catch (err) {
@@ -1260,17 +1748,27 @@ async function startServer() {
         if (!col) throw new Error('কালেক্টর পাওয়া যায়নি।');
         col.Name = String(req.body.Name || col.Name).trim();
         col.Mobile = String(req.body.Mobile ?? col.Mobile).trim();
+
+        let shouldRevoke = false;
         if (req.body.Password && req.body.Password !== '••••••') {
-          col.Password = String(req.body.Password).trim();
+          const strongPwd = assertStrongPassword(String(req.body.Password), 'কালেক্টর পাসওয়ার্ড');
+          col.Password = hashPassword(strongPwd);
+          shouldRevoke = true;
         }
         if (Array.isArray(req.body.AssignedAreas)) {
           col.AssignedAreas = req.body.AssignedAreas;
         }
         if (req.body.Status) {
           col.Status = req.body.Status;
+          if (col.Status !== 'এক্টিভ') {
+            shouldRevoke = true;
+          }
         }
         writeDbAtomic(db);
-        return col;
+        if (shouldRevoke) {
+          revokeSessionsFor('User', col.Username);
+        }
+        return { ...col, Password: '••••••' };
       });
       res.json({ collector: updated });
     } catch (err) {
@@ -1287,8 +1785,10 @@ async function startServer() {
         }
         const idx = db.collectors.findIndex((c) => c.CollectorID === req.params.id);
         if (idx === -1) throw new Error('কালেক্টর পাওয়া যায়নি।');
+        const removed = db.collectors[idx];
         db.collectors.splice(idx, 1);
         writeDbAtomic(db);
+        revokeSessionsFor('User', removed.Username);
       });
       res.json({ ok: true });
     } catch (err) {
@@ -1304,7 +1804,7 @@ async function startServer() {
         const col = db.collectors.find((c) => c.Username === collectorUsername);
         if (!col) throw new Error('কালেক্টর পাওয়া যায়নি।');
         const amt = Number(amount);
-        if (!amt || amt <= 0) throw new Error('সঠিক জমার পরিমাণ লিখুন।');
+        if (!Number.isFinite(amt) || amt <= 0) throw new Error('সঠিক জমার পরিমাণ লিখুন।');
         const row: CollectorDeposit = {
           DepositID: randomId('DP'),
           Date: date || todayStr(),
@@ -1326,7 +1826,7 @@ async function startServer() {
     }
   });
 
-  // Customers CRUD
+  // Customers CRUD (RBAC Hardened)
   app.post('/api/customers', authMiddleware, async (req: AuthedRequest, res) => {
     try {
       const customer = await withLock(() => {
@@ -1342,8 +1842,9 @@ async function startServer() {
           throw new Error('আপনার নির্ধারিত এরিয়ার বাইরে গ্রাহক যোগ করার অনুমতি নেই।');
         }
         const connDate = data.ConnectionDate || todayStr();
-        const opening = Number(data.OpeningBalance || 0);
-        const monthlyBill = Number(data.MonthlyBill || 0);
+        // Only Admin may set an OpeningBalance on customer creation
+        const opening = user.role === 'Admin' ? Math.max(0, Number(data.OpeningBalance || 0)) : 0;
+        const monthlyBill = Math.max(0, Number(data.MonthlyBill || 0));
         const status = data.Status || 'এক্টিভ';
 
         const newCust: Customer = {
@@ -1412,17 +1913,33 @@ async function startServer() {
         const user = req.user!;
         const cust = db.customers.find((c) => c.CustomerID === req.params.id);
         if (!cust) throw new Error('গ্রাহক পাওয়া যায়নি।');
-        if (user.role === 'User' && !user.assignedAreas.includes(cust.Area)) {
-          throw new Error('অন্য এরিয়ার গ্রাহক এডিট করার অনুমতি নেই।');
-        }
+
         const d = req.body;
+        if (user.role === 'User') {
+          if (!user.assignedAreas.includes(cust.Area)) {
+            throw new Error('অন্য এরিয়ার গ্রাহক এডিট করার অনুমতি নেই।');
+          }
+          if (d.Area !== undefined && !user.assignedAreas.includes(String(d.Area).trim())) {
+            throw new Error('আপনার নির্ধারিত এরিয়ার বাইরে গ্রাহক স্থানান্তরের অনুমতি নেই।');
+          }
+          if (
+            (d.MonthlyBill !== undefined && Number(d.MonthlyBill) !== cust.MonthlyBill) ||
+            (d.Package !== undefined && String(d.Package).trim() !== cust.Package) ||
+            (d.ServiceType !== undefined && d.ServiceType !== cust.ServiceType)
+          ) {
+            throw new Error('প্যাকেজ, সার্ভিসের ধরন বা মাসিক বিল শুধুমাত্র অ্যাডমিন পরিবর্তন করতে পারবেন।');
+          }
+        }
+
         cust.Name = String(d.Name ?? cust.Name).trim();
         cust.Mobile = String(d.Mobile ?? cust.Mobile).trim();
         cust.Area = String(d.Area ?? cust.Area).trim();
         cust.Address = String(d.Address ?? cust.Address).trim();
-        cust.ServiceType = d.ServiceType ?? cust.ServiceType;
-        cust.Package = String(d.Package ?? cust.Package).trim();
-        cust.MonthlyBill = Number(d.MonthlyBill ?? cust.MonthlyBill);
+        if (user.role === 'Admin') {
+          cust.ServiceType = d.ServiceType ?? cust.ServiceType;
+          cust.Package = String(d.Package ?? cust.Package).trim();
+          cust.MonthlyBill = Number(d.MonthlyBill ?? cust.MonthlyBill);
+        }
         cust.Status = d.Status ?? cust.Status;
         cust.Note = String(d.Note ?? cust.Note).trim();
         writeDbAtomic(db);
@@ -1473,12 +1990,11 @@ async function startServer() {
     }
   });
 
-  // Automatic Monthly Billing Generator
-  app.post('/api/bills/generate', authMiddleware, async (req: AuthedRequest, res) => {
+  // Automatic Monthly Billing Generator (Admin only or scoped)
+  app.post('/api/bills/generate', authMiddleware, requireAdmin, async (req: AuthedRequest, res) => {
     try {
       const summary = await withLock(() => {
         const db = ensureDb();
-        const user = req.user!;
         const targetMonth: string = String(req.body?.billingMonth || todayStr().slice(0, 7));
         const mode: 'dueOnly' | 'allActive' = req.body?.mode || 'allActive';
         const refToday = todayStr();
@@ -1487,9 +2003,6 @@ async function startServer() {
         let skippedCount = 0;
 
         for (const cust of db.customers) {
-          if (user.role === 'User' && !user.assignedAreas.includes(cust.Area)) {
-            continue;
-          }
           if (cust.Status !== 'এক্টিভ') {
             skippedCount++;
             continue;
@@ -1554,6 +2067,13 @@ async function startServer() {
             throw new Error('আপনার নির্ধারিত এরিয়ার বাইরে বিল আদায়ের অনুমতি নেই।');
           }
 
+          if (user.role === 'User' && date) {
+            const diff = daysBetweenDates(String(date).trim(), todayStr());
+            if (Number.isNaN(diff) || Math.abs(diff) > 1) {
+              throw new Error('কালেক্টর শুধুমাত্র আজ বা ±১ দিনের তারিখে বিল আদায় এন্ট্রি করতে পারবেন।');
+            }
+          }
+
           return {
             params: {
               customerId,
@@ -1590,7 +2110,6 @@ async function startServer() {
         if (idx === -1) throw new Error('রিসিট পাওয়া যায়নি।');
         const rec = db.collections[idx];
 
-        // Reverse PaidAmount back to matching Bills starting from BillingMonth
         let toReverse = rec.Amount;
         const custBills = db.bills.filter((b) => b.CustomerID === rec.CustomerID);
         const startIdx = custBills.findIndex((b) => b.BillingMonth === rec.BillingMonth);
@@ -1707,7 +2226,7 @@ async function startServer() {
         const db = ensureDb();
         const { Date: dt, Category, PaymentAccount, Amount, Note } = req.body;
         const amt = Number(Amount);
-        if (!amt || amt <= 0) throw new Error('সঠিক খরচের পরিমাণ লিখুন।');
+        if (!Number.isFinite(amt) || amt <= 0) throw new Error('সঠিক খরচের পরিমাণ লিখুন।');
         const row: Expense = {
           ExpenseID: randomId('EX'),
           Date: dt || todayStr(),
@@ -1745,61 +2264,66 @@ async function startServer() {
     }
   });
 
-  // Manual / Resend Receipt SMS (Admin or Collector for assigned areas)
-  app.post('/api/sms/send', authMiddleware, async (req: AuthedRequest, res) => {
-    try {
-      const { receiptId, customerId, message } = req.body as {
-        receiptId?: string;
-        customerId?: string;
-        message?: string;
-      };
-      const db = ensureDb();
-      const user = req.user!;
+  // Manual / Resend Receipt SMS (Rate limited)
+  app.post(
+    '/api/sms/send',
+    authMiddleware,
+    rateLimit('sms-send', 30, 60 * 1000, (req) => (req as AuthedRequest).user?.username || getClientIp(req)),
+    async (req: AuthedRequest, res) => {
+      try {
+        const { receiptId, customerId, message } = req.body as {
+          receiptId?: string;
+          customerId?: string;
+          message?: string;
+        };
+        const db = ensureDb();
+        const user = req.user!;
 
-      let targetCustomer: Customer | undefined;
-      let receipt: Collection | undefined;
+        let targetCustomer: Customer | undefined;
+        let receipt: Collection | undefined;
 
-      if (receiptId) {
-        receipt = db.collections.find((c) => c.ReceiptID === receiptId);
-        if (!receipt) throw new Error('রিসিট পাওয়া যায়নি।');
-        targetCustomer = db.customers.find((c) => c.CustomerID === receipt!.CustomerID);
-      } else if (customerId) {
-        targetCustomer = db.customers.find((c) => c.CustomerID === customerId);
+        if (receiptId) {
+          receipt = db.collections.find((c) => c.ReceiptID === receiptId);
+          if (!receipt) throw new Error('রিসিট পাওয়া যায়নি।');
+          targetCustomer = db.customers.find((c) => c.CustomerID === receipt!.CustomerID);
+        } else if (customerId) {
+          targetCustomer = db.customers.find((c) => c.CustomerID === customerId);
+        }
+
+        if (!targetCustomer) throw new Error('গ্রাহক পাওয়া যায়নি।');
+        if (user.role === 'User' && !user.assignedAreas.includes(targetCustomer.Area)) {
+          throw new Error('আপনার নির্ধারিত এরিয়ার বাইরে SMS পাঠানোর অনুমতি নেই।');
+        }
+        if (!targetCustomer.Mobile) throw new Error('গ্রাহকের মোবাইল নম্বর পাওয়া যায়নি।');
+
+        const smsText =
+          message && message.trim()
+            ? message.trim()
+            : receipt
+              ? formatBengaliCollectionSms({
+                  settings: db.settings,
+                  receipt,
+                  monthLabel: getMonthLabelBn(receipt.BillingMonth),
+                })
+              : `সম্মানিত ${targetCustomer.Name} (${targetCustomer.CustomerID}), ${db.settings.CompanyName}-এর পক্ষ থেকে শুভেচ্ছা।`;
+
+        const smsLog = await dispatchSmsAndLog({
+          customerId: targetCustomer.CustomerID,
+          customerName: targetCustomer.Name,
+          mobile: targetCustomer.Mobile,
+          receiptId: receipt?.ReceiptID || 'MANUAL',
+          message: smsText,
+          settings: db.settings,
+          createId: randomId,
+          persistSmsLog,
+        });
+
+        res.json({ smsLog });
+      } catch (err) {
+        res.status(400).json({ error: (err as Error).message });
       }
-
-      if (!targetCustomer) throw new Error('গ্রাহক পাওয়া যায়নি।');
-      if (user.role === 'User' && !user.assignedAreas.includes(targetCustomer.Area)) {
-        throw new Error('আপনার নির্ধারিত এরিয়ার বাইরে SMS পাঠানোর অনুমতি নেই।');
-      }
-      if (!targetCustomer.Mobile) throw new Error('গ্রাহকের মোবাইল নম্বর পাওয়া যায়নি।');
-
-      const smsText =
-        message && message.trim()
-          ? message.trim()
-          : receipt
-            ? formatBengaliCollectionSms({
-                settings: db.settings,
-                receipt,
-                monthLabel: getMonthLabelBn(receipt.BillingMonth),
-              })
-            : `সম্মানিত ${targetCustomer.Name} (${targetCustomer.CustomerID}), ${db.settings.CompanyName}-এর পক্ষ থেকে শুভেচ্ছা।`;
-
-      const smsLog = await dispatchSmsAndLog({
-        customerId: targetCustomer.CustomerID,
-        customerName: targetCustomer.Name,
-        mobile: targetCustomer.Mobile,
-        receiptId: receipt?.ReceiptID || 'MANUAL',
-        message: smsText,
-        settings: db.settings,
-        createId: randomId,
-        persistSmsLog,
-      });
-
-      res.json({ smsLog });
-    } catch (err) {
-      res.status(400).json({ error: (err as Error).message });
     }
-  });
+  );
 
   // Bulk SMS Broadcast (Admin only)
   app.post('/api/sms/broadcast', authMiddleware, requireAdmin, async (req, res) => {
@@ -1833,15 +2357,26 @@ async function startServer() {
     }
   });
 
-  // Settings (Admin only)
-  app.put('/api/settings', authMiddleware, requireAdmin, async (req, res) => {
+  // Settings (Admin only, whitelisted fields, CurrentAdminPassword required on password change)
+  app.put('/api/settings', authMiddleware, requireAdmin, async (req: AuthedRequest, res) => {
     try {
       const updated = await withLock(() => {
         const db = ensureDb();
-        const body = req.body as Partial<SettingsData>;
-        db.settings = {
+        const body = req.body as Partial<SettingsData> & { CurrentAdminPassword?: string };
+
+        const nextSettings: SettingsData = {
           ...db.settings,
-          ...body,
+          CompanyName: body.CompanyName !== undefined ? String(body.CompanyName).trim() : db.settings.CompanyName,
+          BusinessType: body.BusinessType !== undefined ? String(body.BusinessType).trim() : db.settings.BusinessType,
+          Address: body.Address !== undefined ? String(body.Address).trim() : db.settings.Address,
+          Phone: body.Phone !== undefined ? String(body.Phone).trim() : db.settings.Phone,
+          ScrollingNotice:
+            body.ScrollingNotice !== undefined ? String(body.ScrollingNotice).trim() : db.settings.ScrollingNotice,
+          BkashNumber: body.BkashNumber !== undefined ? String(body.BkashNumber).trim() : db.settings.BkashNumber,
+          BkashType: body.BkashType ?? db.settings.BkashType,
+          NagadNumber: body.NagadNumber !== undefined ? String(body.NagadNumber).trim() : db.settings.NagadNumber,
+          NagadType: body.NagadType ?? db.settings.NagadType,
+          RocketNumber: body.RocketNumber !== undefined ? String(body.RocketNumber).trim() : db.settings.RocketNumber,
           BankDetails: {
             ...db.settings.BankDetails,
             ...(body.BankDetails || {}),
@@ -1850,12 +2385,48 @@ async function startServer() {
             ...(db.settings.SmsConfig || DEFAULT_SMS_CONFIG),
             ...(body.SmsConfig || {}),
           },
-          AdminPassword:
-            body.AdminPassword && body.AdminPassword.trim()
-              ? body.AdminPassword.trim()
-              : db.settings.AdminPassword,
         };
+
+        if (body.AdminUsername !== undefined) {
+          const nextUname = String(body.AdminUsername).trim();
+          if (!USERNAME_RE.test(nextUname)) {
+            throw new Error('অ্যাডমিন ইউজারনেম ৩ থেকে ৩২ অক্ষরের ইংরেজি অক্ষর, সংখ্যা বা . _ - হতে হবে।');
+          }
+          if (db.collectors.some((c) => c.Username.toLowerCase() === nextUname.toLowerCase())) {
+            throw new Error('এই ইউজারনেমটি একজন কালেক্টরের জন্য ব্যবহৃত হচ্ছে।');
+          }
+          nextSettings.AdminUsername = nextUname;
+        }
+
+        if (body.PaymentGatewayWebhookSecret !== undefined) {
+          const sec = String(body.PaymentGatewayWebhookSecret).trim();
+          if (sec.length < 16 || sec.length > 128 || sec === DEMO_WEBHOOK_SECRET) {
+            throw new Error('ওয়েবহুক সিক্রেট ১৬ থেকে ১২৮ অক্ষরের মধ্যে হতে হবে (ডেমো সিক্রেট অনুমোদিত নয়)।');
+          }
+          nextSettings.PaymentGatewayWebhookSecret = sec;
+        }
+
+        let passwordChanged = false;
+        if (body.AdminPassword && String(body.AdminPassword).trim()) {
+          if (!verifyPassword(body.CurrentAdminPassword, db.settings.AdminPassword)) {
+            throw new Error('নতুন পাসওয়ার্ড সেট করতে বর্তমান অ্যাডমিন পাসওয়ার্ড সঠিকভাবে দিন।');
+          }
+          const strongPwd = assertStrongPassword(String(body.AdminPassword), 'অ্যাডমিন পাসওয়ার্ড');
+          nextSettings.AdminPassword = hashPassword(strongPwd);
+          passwordChanged = true;
+        }
+
+        const usernameChanged = nextSettings.AdminUsername !== db.settings.AdminUsername;
+        db.settings = nextSettings;
         writeDbAtomic(db);
+
+        if (passwordChanged || usernameChanged) {
+          revokeSessionsFor('Admin', undefined, req.user?.token);
+          if (req.user) {
+            req.user.username = nextSettings.AdminUsername;
+          }
+        }
+
         const { AdminPassword: _hidden, ...safe } = db.settings;
         return safe;
       });
@@ -1866,7 +2437,6 @@ async function startServer() {
   });
 
   // Vite Dev Middleware or Static Production Build
-  const isProd = process.env.NODE_ENV === 'production';
   if (!isProd) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -1880,6 +2450,14 @@ async function startServer() {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }
+
+  // Generic Error Handler (no stack traces leaked to client)
+  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+    console.error('Unhandled server error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'সার্ভারে অপ্রত্যাশিত ত্রুটি হয়েছে।' });
+    }
+  });
 
   app.listen(3000, '0.0.0.0', () => {
     console.log('NetBill ISP server listening on http://0.0.0.0:3000');

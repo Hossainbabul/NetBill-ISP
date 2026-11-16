@@ -69,22 +69,33 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const handleUnauthorized = () => {
+      saveSessionToken('', false);
+      setUser(null);
+      setData(null);
+    };
+    window.addEventListener('netbill:unauthorized', handleUnauthorized);
+
     const token = getSavedToken();
     if (!token) {
       setAuthChecking(false);
-      return;
+    } else {
+      api
+        .getSession()
+        .then((res) => {
+          setUser(res.user);
+          return loadBootstrap();
+        })
+        .catch(() => {
+          saveSessionToken('', false);
+          setUser(null);
+        })
+        .finally(() => setAuthChecking(false));
     }
-    api
-      .getSession()
-      .then((res) => {
-        setUser(res.user);
-        return loadBootstrap();
-      })
-      .catch(() => {
-        saveSessionToken('', false);
-        setUser(null);
-      })
-      .finally(() => setAuthChecking(false));
+
+    return () => {
+      window.removeEventListener('netbill:unauthorized', handleUnauthorized);
+    };
   }, [loadBootstrap]);
 
   const handleLoginSuccess = async (loggedUser: SessionUser) => {
