@@ -40,8 +40,10 @@ type NavTab =
 export default function App() {
   const urlParams =
     typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
-  const initialPagePay = urlParams?.get('page') === 'pay';
+  const pathname = typeof window !== 'undefined' ? window.location.pathname : '/';
   const initialCid = urlParams?.get('cid') || '';
+  const initialPagePay =
+    urlParams?.get('page') === 'pay' || pathname === '/exp' || Boolean(initialCid);
 
   const [publicPayMode, setPublicPayMode] = useState(initialPagePay);
   const [user, setUser] = useState<SessionUser | null>(null);
@@ -121,7 +123,12 @@ export default function App() {
         initialCid={initialCid}
         onExitPortal={() => {
           setPublicPayMode(false);
-          if (typeof window !== 'undefined' && window.location.search.includes('page=pay')) {
+          if (
+            typeof window !== 'undefined' &&
+            (window.location.search.includes('page=pay') ||
+              window.location.search.includes('cid=') ||
+              window.location.pathname === '/exp')
+          ) {
             window.history.replaceState({}, '', '/');
           }
         }}

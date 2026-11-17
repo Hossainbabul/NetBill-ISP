@@ -36,6 +36,30 @@ export interface SmsLog {
   GatewayResponse: string;
 }
 
+export interface DueReminderConfig {
+  Enabled: boolean;
+  SendHour: number;
+  DeadlineDay: number;
+  AutoGenerateBills: boolean;
+  Template: string;
+}
+
+export interface DueReminderResult {
+  ok: boolean;
+  reason?: string;
+  date: string;
+  month: string;
+  eligible: number;
+  alreadySent: number;
+  generatedBills: number;
+  sent: number;
+  failed: number;
+  sample: string;
+  hasLink: boolean;
+  enabled: boolean;
+  lastRunDate: string;
+}
+
 export interface SettingsData {
   CompanyName: string;
   BusinessType: string;
@@ -52,6 +76,7 @@ export interface SettingsData {
   BankDetails: BankDetails;
   PaymentGatewayWebhookSecret: string;
   SmsConfig: SmsConfig;
+  DueReminder?: DueReminderConfig;
 }
 
 export interface Area {

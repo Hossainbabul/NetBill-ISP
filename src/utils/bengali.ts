@@ -129,8 +129,71 @@ export function buildWhatsAppUrl(mobile: string, text: string): string {
 export function buildPayPortalUrl(customerId?: string): string {
   const origin = typeof window !== 'undefined' ? window.location.origin : '';
   return customerId
-    ? `${origin}/?page=pay&cid=${encodeURIComponent(customerId)}`
+    ? `${origin}/exp?cid=${encodeURIComponent(customerId)}`
     : `${origin}/?page=pay`;
+}
+
+const EN_SHORT_MONTHS = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+];
+
+export function formatShortDateEn(dateStr: string): string {
+  const parts = String(dateStr || '').split('-').map(Number);
+  if (parts.length !== 3 || parts.some(Number.isNaN)) return dateStr || getTodayStr();
+  const [y, m, d] = parts;
+  const mon = EN_SHORT_MONTHS[m - 1] || String(m).padStart(2, '0');
+  const yy = String(y).slice(-2);
+  return `${String(d).padStart(2, '0')} ${mon} ${yy}`;
+}
+
+export function formatNumericTaka(amount: number): string {
+  const safe = Number.isFinite(amount) ? amount : 0;
+  return `${safe.toFixed(2)}টাকা`;
+}
+
+export const DEFAULT_DUE_REMINDER_TEMPLATE =
+  'Dear {Name}, আজ আপনার শেষ দিন {LastDate}, আপনার বকেয়া বিল: {DueAmount}। আপনার লাইনটি সচল রাখতে দ্রুত বিল পেমেন্ট করার জন্য নিচের লিংকে ক্লিক করুন {PayLink} Thanks {Company}';
+
+export const DEFAULT_LINK_REMINDER_CONFIG = {
+  Enabled: false,
+  SendHour: 10,
+  DeadlineDay: 10,
+  AutoGenerateBills: true,
+  Template:
+    'Dear {Name}, আপনার ইন্টারনেট বিল দেখতে ও পেমেন্ট করতে নিচের লিংকে ক্লিক করুন {PayLink} প্রতি মাসের ১ থেকে {DeadlineDay} তারিখের মধ্যে বিল পরিশোধ করুন। লিংকটি সংরক্ষণ করে রাখুন, প্রতি মাসে এই লিংকেই আপনার বিল দেখতে পাবেন। Thanks {Company}',
+};
+
+export function formatDueReminderMessage(params: {
+  template: string;
+  name: string;
+  customerId: string;
+  lastDate: string;
+  due: number;
+  companyName: string;
+  keepPayLinkPlaceholder?: boolean;
+}): string {
+  const link = params.keepPayLinkPlaceholder
+    ? '{PayLink}'
+    : buildPayPortalUrl(params.customerId);
+  return params.template
+    .replace(/\{Name\}/g, params.name)
+    .replace(/\{ID\}/g, params.customerId)
+    .replace(/\{LastDate\}/g, formatShortDateEn(params.lastDate))
+    .replace(/\{Due\}/g, formatBnCurrency(params.due))
+    .replace(/\{DueAmount\}/g, formatNumericTaka(params.due))
+    .replace(/\{PayLink\}/g, link)
+    .replace(/\{Company\}/g, params.companyName);
 }
 
 export const INTERNET_PACKAGES = [

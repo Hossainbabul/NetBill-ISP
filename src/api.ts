@@ -5,6 +5,7 @@ import {
   CollectorDeposit,
   Customer,
   DashboardPayload,
+  DueReminderResult,
   EPaymentRequest,
   Expense,
   PaymentMethod,
@@ -239,6 +240,12 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ items }),
     }),
+
+  // Due-bill permanent link reminders
+  dueReminderPreview: () => request<DueReminderResult>('/api/reminders/due-preview'),
+
+  dueReminderRun: () =>
+    request<DueReminderResult>('/api/reminders/due-run', { method: 'POST' }),
 
   // Settings
   updateSettings: (payload: Partial<SettingsData> & { CurrentAdminPassword?: string }) =>

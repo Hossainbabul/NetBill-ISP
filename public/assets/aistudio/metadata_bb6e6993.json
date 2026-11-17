@@ -1,0 +1,6 @@
+{
+  "name": "NetBill ISP – Internet & Cable TV Billing",
+  "description": "সম্পূর্ণ বাংলায় ব্রডব্যান্ড ইন্টারনেট (ISP) ও ক্যাবল টিভি বিলিং, ই-পেমেন্ট (বিকাশ, নগদ, রকেট, ব্যাংক), কালেক্টর লেজার এবং POS/A4 রিপোর্ট ম্যানেজমেন্ট সফটওয়্যার।",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

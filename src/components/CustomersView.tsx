@@ -3,6 +3,7 @@ import {
   FileText,
   Link2,
   MessageCircle,
+  MessageSquare,
   MoreVertical,
   Plus,
   Printer,
@@ -17,10 +18,12 @@ import { api } from '../api';
 import { Customer, DashboardPayload, ServiceType, SessionUser } from '../types';
 import {
   CABLE_PACKAGES,
+  DEFAULT_DUE_REMINDER_TEMPLATE,
   INTERNET_PACKAGES,
   buildPayPortalUrl,
   buildWhatsAppUrl,
   formatBnCurrency,
+  formatDueReminderMessage,
   getMonthLabelBn,
   getTodayStr,
   paymentMethodLabel,
@@ -79,6 +82,10 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
   const [deleteTarget, setDeleteTarget] = useState<Customer | null>(null);
   const [deleteError, setDeleteError] = useState('');
   const [deleting, setDeleting] = useState(false);
+
+  // SMS reminder feedback
+  const [smsFeedback, setSmsFeedback] = useState('');
+  const [sendingSmsId, setSendingSmsId] = useState<string | null>(null);
 
   const dueMap = useMemo(() => {
     const map = new Map<string, number>();
@@ -208,15 +215,46 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
     }
   };
 
-  const getPayLinkWa = (c: Customer) => {
+  const buildDueReminderText = (c: Customer) => {
     const due = dueMap.get(c.CustomerID) || 0;
-    const payLink = buildPayPortalUrl(c.CustomerID);
-    const text = `আসসালামু আলাইকুম ${c.Name} (আইডি: ${c.CustomerID}), আপনার বর্তমান মোট বকেয়া ${formatBnCurrency(
-      due
-    )}। ঘরে বসে বিকাশ/নগদ/রকেট বা ব্যাংকের মাধ্যমে বিল পরিশোধ করতে নিচের লিংকে ক্লিক করুন:\n${payLink}\n- ${
-      data.settings.CompanyName
-    }`;
-    return buildWhatsAppUrl(c.Mobile, text);
+    return formatDueReminderMessage({
+      template: DEFAULT_DUE_REMINDER_TEMPLATE,
+      name: c.Name,
+      customerId: c.CustomerID,
+      lastDate: c.NextBillDate || getTodayStr(),
+      due,
+      companyName: data.settings.CompanyName,
+    });
+  };
+
+  const getPayLinkWa = (c: Customer) => {
+    return buildWhatsAppUrl(c.Mobile, buildDueReminderText(c));
+  };
+
+  const handleSendDueReminderSms = async (c: Customer) => {
+    setOpenMenuId(null);
+    setSendingSmsId(c.CustomerID);
+    setSmsFeedback('');
+    try {
+      const res = await api.sendSms({
+        customerId: c.CustomerID,
+        message: buildDueReminderText(c),
+      });
+      setSmsFeedback(
+        `${c.Name} (${toBnDigits(c.Mobile)}) নম্বরে বকেয়া রিমাইন্ডার SMS ${
+          res.smsLog.Status === 'Sent'
+            ? 'পাঠানো হয়েছে'
+            : res.smsLog.Status === 'Simulated'
+              ? 'স্যান্ডবক্স লগে সংরক্ষিত হয়েছে'
+              : 'পাঠানো ব্যর্থ হয়েছে'
+        }।`
+      );
+      await onRefresh();
+    } catch (err) {
+      setSmsFeedback((err as Error).message);
+    } finally {
+      setSendingSmsId(null);
+    }
   };
 
   const getRegReceiptWa = (c: Customer) => {
@@ -318,6 +356,19 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
         </div>
       </section>
 
+      {smsFeedback && (
+        <div className="flex items-center justify-between rounded-xl border border-teal-200 bg-teal-50 px-4 py-2.5 text-xs font-medium text-[#0f4c5c]">
+          <span>{smsFeedback}</span>
+          <button
+            type="button"
+            onClick={() => setSmsFeedback('')}
+            className="text-slate-500 hover:text-slate-900"
+          >
+            বন্ধ
+          </button>
+        </div>
+      )}
+
       {/* Customer List Table */}
       <section className="rounded-xl border border-slate-200 bg-white overflow-visible">
         <div className="overflow-x-auto">
@@ -415,6 +466,16 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
                           >
                             <FileText className="h-3.5 w-3.5 text-slate-600" />
                             গ্রাহক লেজার ও প্রিন্ট
+                          </button>
+
+                          <button
+                            type="button"
+                            disabled={sendingSmsId === c.CustomerID}
+                            onClick={() => handleSendDueReminderSms(c)}
+                            className="flex w-full items-center gap-2 px-3.5 py-2 text-xs font-medium text-[#0f4c5c] hover:bg-teal-50/60 disabled:opacity-50"
+                          >
+                            <MessageSquare className="h-3.5 w-3.5" />
+                            বকেয়া রিমাইন্ডার SMS পাঠান
                           </button>
 
                           <a

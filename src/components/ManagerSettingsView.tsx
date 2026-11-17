@@ -1,6 +1,8 @@
 import React, { useMemo, useState } from 'react';
 import {
+  CalendarClock,
   CheckCircle2,
+  Eye,
   FileBarChart2,
   MessageCircle,
   MessageSquare,
@@ -13,6 +15,8 @@ import {
 import { api } from '../api';
 import {
   DashboardPayload,
+  DueReminderConfig,
+  DueReminderResult,
   Expense,
   ExpenseCategory,
   PaymentMethod,
@@ -20,10 +24,12 @@ import {
   SmsProvider,
 } from '../types';
 import {
+  DEFAULT_DUE_REMINDER_TEMPLATE,
+  DEFAULT_LINK_REMINDER_CONFIG,
   EXPENSE_CATEGORIES,
-  buildPayPortalUrl,
   buildWhatsAppUrl,
   formatBnCurrency,
+  formatDueReminderMessage,
   getCurrentMonthStr,
   getMonthLabelBn,
   getTodayStr,
@@ -75,9 +81,7 @@ export const ManagerView: React.FC<ManagerViewProps> = ({ data, onRefresh, onPri
   // Broadcast State
   const [bcArea, setBcArea] = useState('ALL');
   const [bcFilter, setBcFilter] = useState<'ALL' | 'DUE_ONLY'>('DUE_ONLY');
-  const [bcTemplate, setBcTemplate] = useState(
-    'আসসালামু আলাইকুম {Name} (আইডি: {ID}), আপনার মাসিক ইন্টারনেট/ক্যাবল বিলের বর্তমান বকেয়া {Due}। ঘরে বসে বিকাশ/নগদ/ব্যাংকে পেমেন্ট করতে ক্লিক করুন: {PayLink}'
-  );
+  const [bcTemplate, setBcTemplate] = useState(DEFAULT_DUE_REMINDER_TEMPLATE);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [sendingBulkSms, setSendingBulkSms] = useState(false);
   const [bulkSmsMsg, setBulkSmsMsg] = useState('');
@@ -202,13 +206,17 @@ export const ManagerView: React.FC<ManagerViewProps> = ({ data, onRefresh, onPri
     });
   }, [data.customers, bcArea, bcFilter, dueMap]);
 
-  const formatBroadcastMsg = (c: (typeof data.customers)[0]) => {
+  const formatBroadcastMsg = (c: (typeof data.customers)[0], keepPayLinkPlaceholder = false) => {
     const due = dueMap.get(c.CustomerID) || 0;
-    return bcTemplate
-      .replace(/\{Name\}/g, c.Name)
-      .replace(/\{ID\}/g, c.CustomerID)
-      .replace(/\{Due\}/g, formatBnCurrency(due))
-      .replace(/\{PayLink\}/g, buildPayPortalUrl(c.CustomerID));
+    return formatDueReminderMessage({
+      template: bcTemplate,
+      name: c.Name,
+      customerId: c.CustomerID,
+      lastDate: c.NextBillDate || getTodayStr(),
+      due,
+      companyName: data.settings.CompanyName,
+      keepPayLinkPlaceholder,
+    });
   };
 
   // Print Reports Builder
@@ -815,10 +823,13 @@ export const ManagerView: React.FC<ManagerViewProps> = ({ data, onRefresh, onPri
             <div>
               <h3 className="text-base font-bold text-slate-900">বাল্ক SMS ও WhatsApp ব্রডকাস্ট</h3>
               <p className="text-xs text-slate-500">
-                প্লেইসহোল্ডার ব্যবহার করুন: <code className="font-mono-num">{'{Name}'}</code>,{' '}
+                প্লেইসহোল্ডার: <code className="font-mono-num">{'{Name}'}</code>,{' '}
                 <code className="font-mono-num">{'{ID}'}</code>,{' '}
+                <code className="font-mono-num">{'{LastDate}'}</code>,{' '}
+                <code className="font-mono-num">{'{DueAmount}'}</code>,{' '}
                 <code className="font-mono-num">{'{Due}'}</code>,{' '}
-                <code className="font-mono-num">{'{PayLink}'}</code>
+                <code className="font-mono-num">{'{PayLink}'}</code>,{' '}
+                <code className="font-mono-num">{'{Company}'}</code>
               </p>
             </div>
 
@@ -837,7 +848,7 @@ export const ManagerView: React.FC<ManagerViewProps> = ({ data, onRefresh, onPri
                   const res = await api.broadcastSms(
                     targetCustomers.map((c) => ({
                       customerId: c.CustomerID,
-                      message: formatBroadcastMsg(c),
+                      message: formatBroadcastMsg(c, true),
                     }))
                   );
                   setBulkSmsMsg(
@@ -1101,15 +1112,31 @@ interface SettingsViewProps {
   onRefresh: () => Promise<void>;
 }
 
+const resolveDueReminder = (dr?: DueReminderConfig): DueReminderConfig => ({
+  Enabled: dr?.Enabled ?? DEFAULT_LINK_REMINDER_CONFIG.Enabled,
+  SendHour: dr?.SendHour ?? DEFAULT_LINK_REMINDER_CONFIG.SendHour,
+  DeadlineDay: dr?.DeadlineDay ?? DEFAULT_LINK_REMINDER_CONFIG.DeadlineDay,
+  AutoGenerateBills: dr?.AutoGenerateBills ?? DEFAULT_LINK_REMINDER_CONFIG.AutoGenerateBills,
+  Template: dr?.Template || DEFAULT_LINK_REMINDER_CONFIG.Template,
+});
+
 export const SettingsView: React.FC<SettingsViewProps> = ({ data, onRefresh }) => {
   const [form, setForm] = useState<Partial<SettingsData> & { CurrentAdminPassword?: string }>({
     ...data.settings,
+    DueReminder: resolveDueReminder(data.settings.DueReminder),
     AdminPassword: '',
     CurrentAdminPassword: '',
   });
   const [saving, setSaving] = useState(false);
   const [savedMsg, setSavedMsg] = useState('');
   const [err, setErr] = useState('');
+
+  const [duePreviewLoading, setDuePreviewLoading] = useState(false);
+  const [dueRunLoading, setDueRunLoading] = useState(false);
+  const [dueResult, setDueResult] = useState<DueReminderResult | null>(null);
+  const [dueError, setDueError] = useState('');
+
+  const dueReminder = resolveDueReminder(form.DueReminder);
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1125,6 +1152,33 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ data, onRefresh }) =
       setErr((error as Error).message);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleDuePreview = async () => {
+    setDuePreviewLoading(true);
+    setDueError('');
+    try {
+      const res = await api.dueReminderPreview();
+      setDueResult(res);
+    } catch (error) {
+      setDueError((error as Error).message);
+    } finally {
+      setDuePreviewLoading(false);
+    }
+  };
+
+  const handleDueRun = async () => {
+    setDueRunLoading(true);
+    setDueError('');
+    try {
+      const res = await api.dueReminderRun();
+      setDueResult(res);
+      await onRefresh();
+    } catch (error) {
+      setDueError((error as Error).message);
+    } finally {
+      setDueRunLoading(false);
     }
   };
 
@@ -1460,6 +1514,206 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ data, onRefresh }) =
             নিরাপত্তার স্বার্থে Twilio Auth Token অথবা Local SMS API Key সরাসরি সার্ভার এনভায়রনমেন্ট
             (Secrets / <code className="font-mono-num">.env</code>) থেকে ব্যবহৃত হয়।
           </p>
+        </section>
+
+        {/* One-time Permanent Payment Link SMS & Automatic Monthly Billing */}
+        <section className="rounded-xl border border-slate-200 bg-white p-5 space-y-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 className="flex items-center gap-2 text-lg font-bold text-slate-900">
+                <CalendarClock className="h-5 w-5 text-[#0f4c5c]" />
+                <span>পেমেন্ট লিংক SMS ও মাসিক বিল</span>
+              </h2>
+              <p className="text-xs text-slate-500">
+                প্রতিটি সক্রিয় গ্রাহককে একবার স্থায়ী পেমেন্ট লিংক SMS পাঠানো হবে এবং প্রতি মাসে স্বয়ংক্রিয়ভাবে নতুন মাসের বিল তৈরি হবে।
+              </p>
+            </div>
+            {dueResult?.lastRunDate && (
+              <span className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs text-slate-600">
+                সর্বশেষ প্রেরণ: <strong className="font-mono-num">{dueResult.lastRunDate}</strong>
+              </span>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <label
+              htmlFor="due-reminder-enabled"
+              className="flex cursor-pointer items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 px-4 py-3"
+            >
+              <input
+                id="due-reminder-enabled"
+                type="checkbox"
+                checked={dueReminder.Enabled}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    DueReminder: { ...dueReminder, Enabled: e.target.checked },
+                  })
+                }
+                className="h-4 w-4 rounded border-slate-300 text-[#0f4c5c]"
+              />
+              <div>
+                <span className="block text-sm font-semibold text-slate-900">
+                  স্বয়ংক্রিয় পেমেন্ট লিংক SMS চালু করুন
+                </span>
+                <span className="block text-[11px] text-slate-500">
+                  প্রতিটি গ্রাহক একবারই লিংক পাবেন (ডিফল্ট বন্ধ)
+                </span>
+              </div>
+            </label>
+
+            <label
+              htmlFor="due-reminder-autobill"
+              className="flex cursor-pointer items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 px-4 py-3"
+            >
+              <input
+                id="due-reminder-autobill"
+                type="checkbox"
+                checked={dueReminder.AutoGenerateBills}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    DueReminder: { ...dueReminder, AutoGenerateBills: e.target.checked },
+                  })
+                }
+                className="h-4 w-4 rounded border-slate-300 text-[#0f4c5c]"
+              />
+              <div>
+                <span className="block text-sm font-semibold text-slate-900">
+                  স্বয়ংক্রিয় মাসিক বিল তৈরি করুন
+                </span>
+                <span className="block text-[11px] text-slate-500">
+                  নতুন মাসে প্রবেশ করলে সক্রিয় গ্রাহকদের বিল তৈরি হবে
+                </span>
+              </div>
+            </label>
+          </div>
+
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-slate-700">
+                SMS পাঠানোর সময় (ঘণ্টা, ০–২৩ · বাংলাদেশ সময়)
+              </label>
+              <input
+                type="number"
+                min={0}
+                max={23}
+                value={dueReminder.SendHour}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    DueReminder: { ...dueReminder, SendHour: Number(e.target.value) },
+                  })
+                }
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono-num text-sm"
+              />
+            </div>
+
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-slate-700">
+                পেমেন্টের শেষ তারিখ (প্রতি মাসের দিন, ১–৩১)
+              </label>
+              <input
+                type="number"
+                min={1}
+                max={31}
+                value={dueReminder.DeadlineDay}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    DueReminder: { ...dueReminder, DeadlineDay: Number(e.target.value) },
+                  })
+                }
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono-num text-sm"
+              />
+            </div>
+
+            <div className="sm:col-span-2">
+              <label className="mb-1 block text-xs font-semibold text-slate-700">
+                স্থায়ী পেমেন্ট লিংক SMS টেমপ্লেট
+              </label>
+              <textarea
+                rows={3}
+                value={dueReminder.Template}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    DueReminder: { ...dueReminder, Template: e.target.value },
+                  })
+                }
+                className="w-full rounded-lg border border-slate-300 p-3 text-sm"
+              />
+              <p className="mt-1 text-[11px] text-slate-500">
+                প্লেইসহোল্ডারসমূহ: <code className="font-mono-num">{'{Name}'}</code>,{' '}
+                <code className="font-mono-num">{'{ID}'}</code>,{' '}
+                <code className="font-mono-num">{'{DeadlineDay}'}</code>,{' '}
+                <code className="font-mono-num">{'{PayLink}'}</code>,{' '}
+                <code className="font-mono-num">{'{Company}'}</code>
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3 border-t border-slate-100 pt-3">
+            <button
+              type="button"
+              disabled={duePreviewLoading || dueRunLoading}
+              onClick={handleDuePreview}
+              className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-50"
+            >
+              <Eye className="h-3.5 w-3.5 text-[#0f4c5c]" />
+              {duePreviewLoading ? 'হিসাব হচ্ছে...' : 'কারা পাবেন দেখুন'}
+            </button>
+
+            <button
+              type="button"
+              disabled={duePreviewLoading || dueRunLoading}
+              onClick={handleDueRun}
+              className="inline-flex items-center gap-2 rounded-lg bg-[#0f4c5c] px-4 py-2 text-xs font-semibold text-white hover:bg-[#135d66] disabled:opacity-50"
+            >
+              <Send className="h-3.5 w-3.5" />
+              {dueRunLoading ? 'পাঠানো হচ্ছে...' : 'এখনই পাঠান'}
+            </button>
+
+            <span className="text-[11px] text-slate-500">
+              সেটিংস পরিবর্তন করলে প্রথমে নিচের "সেটিংস সংরক্ষণ করুন" বাটনে ক্লিক করুন।
+            </span>
+          </div>
+
+          {dueError && (
+            <div className="rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-xs font-medium text-red-700">
+              {dueError}
+            </div>
+          )}
+
+          {dueResult && (
+            <div className="rounded-lg border border-teal-200 bg-teal-50/50 p-4 text-xs space-y-2">
+              <div className="flex flex-wrap gap-4 font-semibold text-slate-800">
+                <span>নতুন লিংক পাবেন: {toBnDigits(dueResult.eligible)} জন</span>
+                <span>ইতিমধ্যে পেয়েছেন: {toBnDigits(dueResult.alreadySent)} জন</span>
+                <span>নতুন বিল তৈরি: {toBnDigits(dueResult.generatedBills)}টি</span>
+                {(dueResult.sent > 0 || dueResult.failed > 0) && (
+                  <span className="text-emerald-700">
+                    পাঠানো হয়েছে: {toBnDigits(dueResult.sent)} জন
+                    {dueResult.failed > 0 ? ` (ব্যর্থ: ${toBnDigits(dueResult.failed)})` : ''}
+                  </span>
+                )}
+              </div>
+
+              {!dueResult.hasLink && (
+                <p className="text-amber-700">
+                  সতর্কতা: পেমেন্ট লিংকের জন্য <code className="font-mono-num">.env</code> ফাইলে{' '}
+                  <code className="font-mono-num">APP_URL</code> সেট করুন অথবা আপনার আসল ডোমেইন দিয়ে খুলুন (localhost লিংক গ্রাহকের ফোনে খুলবে না)।
+                </p>
+              )}
+
+              {dueResult.sample && (
+                <div className="rounded border border-slate-200 bg-white p-2.5 text-slate-700">
+                  <span className="block font-semibold text-slate-500 mb-1">নমুনা SMS:</span>
+                  {dueResult.sample}
+                </div>
+              )}
+            </div>
+          )}
         </section>
 
         <section className="rounded-xl border border-slate-200 bg-white p-5 space-y-4">

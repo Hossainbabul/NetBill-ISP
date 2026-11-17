@@ -13,6 +13,7 @@ import type {
   CollectorDeposit,
   CollectorSummary,
   Customer,
+  DueReminderConfig,
   EPaymentRequest,
   Expense,
   PaymentMethod,
@@ -40,36 +41,214 @@ interface DatabaseSchema {
   deposits: CollectorDeposit[];
   expenses: Expense[];
   smsLogs: SmsLog[];
+  dueReminder?: { lastRunDate: string; linkSent: Record<string, string>; billsMonth: string };
 }
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'netbill-db.json');
 
+// ─────────────────────────────────────────────────────────────
+// SECURITY HELPERS (hashing, rate limiting, sessions, validation)
+// ─────────────────────────────────────────────────────────────
+const IS_PROD = process.env.NODE_ENV === 'production' || process.argv.includes('--prod');
+const SESSION_IDLE_MS = (Number(process.env.SESSION_IDLE_HOURS) || 12) * 60 * 60 * 1000;
+const SESSION_MAX_MS = 7 * 24 * 60 * 60 * 1000;
+const MAX_PAYMENT_AMOUNT = 1_000_000;
 const MIN_PASSWORD_LENGTH = 8;
-const USERNAME_RE = /^[A-Za-z0-9._-]{3,32}$/;
+const MASKED_PASSWORD = '••••••';
 const DEMO_WEBHOOK_SECRET = 'nb_whsec_demo_2026';
-const WEAK_PASSWORDS = new Set([
-  '1234',
-  '12345',
-  '123456',
-  '1234567',
-  '12345678',
-  '123456789',
-  '1234567890',
-  'admin',
-  'admin123',
-  'admin1234',
-  'administrator',
-  'password',
-  'password123',
-  'qwerty',
-  'qwerty123',
-  '00000000',
-  '11111111',
-  'letmein1',
-  'welcome1',
-  'netbill123',
-]);
+const TRX_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9\-_.]{3,39}$/;
+const ALLOWED_PAYMENT_METHODS: readonly string[] = ['Cash', 'bKash', 'Nagad', 'Rocket', 'Bank'];
+const PUBLIC_PAYMENT_METHODS: readonly string[] = ['bKash', 'Nagad', 'Rocket', 'Bank'];
+const DEFAULT_ADMIN_PASSWORDS = ['admin123', 'admin', 'password', '123456', '12345678'];
+const DEFAULT_COLLECTOR_PASSWORDS = ['1234', '12345', '123456', 'password', '0000'];
+const WEAK_PASSWORDS = [
+  'admin123', 'admin1234', 'password', 'password1', '12345678', '123456789',
+  '1234567890', 'qwerty123', '11111111', '00000000', 'abcd1234',
+];
+
+class DuplicateTrxError extends Error {
+  constructor() {
+    super('এই TrxID দিয়ে ইতিমধ্যেই পেমেন্ট রেকর্ড করা হয়েছে।');
+    this.name = 'DuplicateTrxError';
+  }
+}
+class WebhookAuthError extends Error {
+  constructor() {
+    super('Invalid webhook secret');
+    this.name = 'WebhookAuthError';
+  }
+}
+
+// ---- Password hashing (scrypt, built into Node – no extra dependency) ----
+function hashPassword(plain: string): string {
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.scryptSync(plain, salt, 64);
+  return `scrypt$${salt.toString('hex')}$${hash.toString('hex')}`;
+}
+
+function isHashedPassword(v: unknown): v is string {
+  return typeof v === 'string' && v.startsWith('scrypt$');
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
+}
+
+function verifyPassword(plain: string | undefined, stored: string | undefined): boolean {
+  if (!plain || !stored) return false;
+  if (!isHashedPassword(stored)) {
+    // Legacy plain-text value (migrated to a hash automatically at startup)
+    return safeEqual(plain, stored);
+  }
+  const [, saltHex, hashHex] = stored.split('$');
+  if (!saltHex || !hashHex) return false;
+  const expected = Buffer.from(hashHex, 'hex');
+  const actual = crypto.scryptSync(plain, Buffer.from(saltHex, 'hex'), expected.length);
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+
+const DUMMY_HASH = hashPassword(crypto.randomBytes(8).toString('hex'));
+
+function generatePassword(len = 14): string {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+  let out = '';
+  for (let i = 0; i < len; i++) out += alphabet[crypto.randomInt(alphabet.length)];
+  return out;
+}
+
+function assertStrongPassword(pw: string): void {
+  if (pw.length < MIN_PASSWORD_LENGTH) {
+    throw new Error(`পাসওয়ার্ড কমপক্ষে ${MIN_PASSWORD_LENGTH} অক্ষরের হতে হবে।`);
+  }
+  if (pw.length > 128) {
+    throw new Error('পাসওয়ার্ড অনেক দীর্ঘ (সর্বোচ্চ ১২৮ অক্ষর)।');
+  }
+  if (WEAK_PASSWORDS.includes(pw.toLowerCase())) {
+    throw new Error('এই পাসওয়ার্ডটি খুব সহজ ও পরিচিত। অন্য একটি শক্ত পাসওয়ার্ড দিন।');
+  }
+}
+
+// ---- Input validation helpers ----
+function isValidBillingMonth(m: string): boolean {
+  return m === 'Opening' || /^\d{4}-(0[1-9]|1[0-2])$/.test(m);
+}
+
+function normalizeMobile(input: string): string {
+  let d = String(input || '').replace(/\D/g, '');
+  if (d.startsWith('880')) d = d.slice(2);
+  if (d.length === 10 && d.startsWith('1')) d = `0${d}`;
+  return d;
+}
+
+function maskMobile(input: string): string {
+  const d = String(input || '').replace(/\D/g, '');
+  if (d.length < 7) return '***';
+  return `${d.slice(0, 3)}${'*'.repeat(d.length - 5)}${d.slice(-2)}`;
+}
+
+function maskTrx(trx: string): string {
+  const t = String(trx || '');
+  if (t.length <= 5) return '***';
+  return `${t.slice(0, 2)}***${t.slice(-3)}`;
+}
+
+/**
+ * Public website address used inside SMS payment links.
+ * Uses APP_URL from .env; otherwise the address the admin is browsing from —
+ * but never localhost (a localhost link cannot open on a customer's phone).
+ */
+function getPublicBaseUrl(req: Request): string {
+  const env = (process.env.APP_URL || '').trim().replace(/\/+$/, '');
+  if (/^https?:\/\/[^\s/]+/i.test(env) && !/MY_APP_URL/i.test(env)) return env;
+  const host = req.get('host') || '';
+  if (!host || /^(localhost|127\.|0\.0\.0\.0|\[::1\])/i.test(host)) return '';
+  return `${req.protocol}://${host}`;
+}
+
+// ---- In-memory rate limiter (no extra dependency) ----
+interface RateBucket {
+  count: number;
+  resetAt: number;
+}
+const rateBuckets = new Map<string, RateBucket>();
+
+/** Returns seconds to wait if the key is currently over its limit, otherwise 0. */
+function rateCheck(key: string, max: number): number {
+  const b = rateBuckets.get(key);
+  const now = Date.now();
+  if (!b || b.resetAt <= now) return 0;
+  return b.count >= max ? Math.ceil((b.resetAt - now) / 1000) : 0;
+}
+
+function rateHit(key: string, windowMs: number): void {
+  const now = Date.now();
+  const b = rateBuckets.get(key);
+  if (!b || b.resetAt <= now) {
+    rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+  } else {
+    b.count++;
+  }
+}
+
+function rateClear(key: string): void {
+  rateBuckets.delete(key);
+}
+
+function rateLimit(name: string, max: number, windowMs: number) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const key = `${name}:${req.ip}`;
+    const wait = rateCheck(key, max);
+    if (wait > 0) {
+      res.setHeader('Retry-After', String(wait));
+      res.status(429).json({
+        error: 'অনেক বেশি অনুরোধ করা হয়েছে। কিছুক্ষণ পর আবার চেষ্টা করুন।',
+      });
+      return;
+    }
+    rateHit(key, windowMs);
+    next();
+  };
+}
+
+// ---- Sessions with idle + absolute expiry ----
+interface SessionMeta {
+  createdAt: number;
+  lastSeen: number;
+}
+const sessions = new Map<string, SessionUser>();
+const sessionMeta = new Map<string, SessionMeta>();
+
+function createSession(user: SessionUser): void {
+  const now = Date.now();
+  sessions.set(user.token, user);
+  sessionMeta.set(user.token, { createdAt: now, lastSeen: now });
+}
+
+function destroySession(token: string): void {
+  sessions.delete(token);
+  sessionMeta.delete(token);
+}
+
+function revokeSessionsFor(username: string, exceptToken?: string): void {
+  for (const [token, u] of sessions) {
+    if (u.username === username && token !== exceptToken) destroySession(token);
+  }
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, b] of rateBuckets) {
+    if (b.resetAt <= now) rateBuckets.delete(k);
+  }
+  for (const [token, m] of sessionMeta) {
+    if (now - m.lastSeen > SESSION_IDLE_MS || now - m.createdAt > SESSION_MAX_MS) {
+      destroySession(token);
+    }
+  }
+}, 5 * 60 * 1000).unref();
 
 const BN_DIGITS = ['০', '১', '২', '৩', '৪', '৫', '৬', '৭', '৮', '৯'];
 const BN_MONTHS: Record<string, string> = {
@@ -129,95 +308,8 @@ function todayStr(): string {
 }
 
 function randomId(prefix: string): string {
-  const num = crypto.randomInt(100000, 1000000);
+  const num = Math.floor(100000 + Math.random() * 900000);
   return `${prefix}-${num}`;
-}
-
-function safeEqual(a: string, b: string): boolean {
-  const hashA = crypto.createHash('sha256').update(String(a)).digest();
-  const hashB = crypto.createHash('sha256').update(String(b)).digest();
-  return crypto.timingSafeEqual(hashA, hashB);
-}
-
-function isHashedPassword(stored: string | undefined): boolean {
-  if (!stored) return false;
-  const parts = stored.split('$');
-  return parts.length === 3 && parts[0] === 'scrypt' && parts[1].length >= 16 && parts[2].length === 128;
-}
-
-function hashPassword(plain: string): string {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const derived = crypto.scryptSync(plain, salt, 64).toString('hex');
-  return `scrypt$${salt}$${derived}`;
-}
-
-function verifyPassword(plain: string | undefined, stored: string | undefined): boolean {
-  if (!plain || !stored) return false;
-  if (isHashedPassword(stored)) {
-    const [, salt, hexHash] = stored.split('$');
-    const derived = crypto.scryptSync(plain, salt, 64);
-    const expected = Buffer.from(hexHash, 'hex');
-    if (derived.length !== expected.length) return false;
-    return crypto.timingSafeEqual(derived, expected);
-  }
-  return safeEqual(plain, stored);
-}
-
-function isWeakPasswordValue(pwd: string): boolean {
-  const trimmed = pwd.trim();
-  if (trimmed.length < MIN_PASSWORD_LENGTH) return true;
-  if (WEAK_PASSWORDS.has(trimmed.toLowerCase())) return true;
-  if (/^(.)\1+$/.test(trimmed)) return true;
-  return false;
-}
-
-function assertStrongPassword(pwd: string, label = 'পাসওয়ার্ড'): string {
-  const raw = String(pwd || '');
-  if (raw.trim().length < MIN_PASSWORD_LENGTH || raw.length > 128) {
-    throw new Error(`${label} কমপক্ষে ${toBnDigits(MIN_PASSWORD_LENGTH)} অক্ষরের হতে হবে।`);
-  }
-  if (isWeakPasswordValue(raw)) {
-    throw new Error(`দয়া করে আরও শক্তিশালী ${label} ব্যবহার করুন (সহজ/সাধারণ পাসওয়ার্ড অনুমোদিত নয়)।`);
-  }
-  return raw;
-}
-
-function generateStrongPassword(): string {
-  return crypto.randomBytes(9).toString('base64url');
-}
-
-function generateWebhookSecret(): string {
-  return `nb_whsec_${crypto.randomBytes(18).toString('hex')}`;
-}
-
-function maskMobile(mobile: string): string {
-  const digits = String(mobile || '').replace(/\D/g, '');
-  if (digits.length < 6) return '***';
-  return `${digits.slice(0, 3)}******${digits.slice(-2)}`;
-}
-
-function maskTrx(trx: string): string {
-  const s = String(trx || '').trim();
-  if (!s) return '';
-  if (s.length <= 4) return '****';
-  return `${s.slice(0, 2)}${'*'.repeat(Math.min(8, s.length - 4))}${s.slice(-2)}`;
-}
-
-function normalizeMobileDigits(mobile: string): string {
-  const digits = String(mobile || '').replace(/\D/g, '');
-  if (digits.startsWith('8801') && digits.length === 13) {
-    return digits.slice(2);
-  }
-  return digits;
-}
-
-class DuplicateTrxError extends Error {
-  public existingReceipt?: Collection;
-  constructor(message: string, existingReceipt?: Collection) {
-    super(message);
-    this.name = 'DuplicateTrxError';
-    this.existingReceipt = existingReceipt;
-  }
 }
 
 function createSeedDatabase(): DatabaseSchema {
@@ -230,7 +322,7 @@ function createSeedDatabase(): DatabaseSchema {
       ScrollingNotice:
         'সম্মানিত গ্রাহকগণ, প্রতি মাসের ১০ তারিখের মধ্যে আপনার ইন্টারনেট ও ডিস বিল বিকাশ/নগদ/রকেট বা অনলাইন পেমেন্ট পোর্টালের মাধ্যমে পরিশোধ করুন। সহায়তার জন্য কল করুন: ০১৭১১-২২৩৩৪৪।',
       AdminUsername: 'admin',
-      AdminPassword: '',
+      AdminPassword: '', // generated at first start (see hardenCredentials)
       BkashNumber: '01711-223344',
       BkashType: 'Merchant',
       NagadNumber: '01811-556677',
@@ -243,7 +335,7 @@ function createSeedDatabase(): DatabaseSchema {
         Branch: 'মিরপুর শাখা, ঢাকা',
         Routing: '090262987',
       },
-      PaymentGatewayWebhookSecret: '',
+      PaymentGatewayWebhookSecret: '', // generated at first start
       SmsConfig: {
         Enabled: true,
         Provider: (process.env.SMS_PROVIDER as SmsProvider) || 'sandbox',
@@ -264,7 +356,7 @@ function createSeedDatabase(): DatabaseSchema {
         Name: 'মোঃ রফিকুল ইসলাম',
         Mobile: '01712-345678',
         Username: 'rafiq',
-        Password: '',
+        Password: '', // generated at first start
         AssignedAreas: ['মিরপুর ১০ (সেক্টর এ)', 'কাজীপাড়া উত্তর'],
         Status: 'এক্টিভ',
         CreatedAt: '2026-01-15',
@@ -274,7 +366,7 @@ function createSeedDatabase(): DatabaseSchema {
         Name: 'সোহেল রানা',
         Mobile: '01819-876543',
         Username: 'sohel',
-        Password: '',
+        Password: '', // generated at first start
         AssignedAreas: ['শেওড়াপাড়া বাজার', 'পল্লবী আবাসিক'],
         Status: 'এক্টিভ',
         CreatedAt: '2026-02-18',
@@ -443,22 +535,32 @@ function createSeedDatabase(): DatabaseSchema {
       },
     ],
     bills: [
+      // October & November 2026 bills + Opening
       { BillID: 'BL-9001', CustomerID: 'NB-1001', BillingMonth: '2026-10', MonthLabel: 'অক্টোবর ২০২৬', BillType: 'Monthly', Amount: 1000, PaidAmount: 1000, DueAmount: 0, Status: 'পরিশোধিত', GeneratedDate: '2026-10-01' },
       { BillID: 'BL-9002', CustomerID: 'NB-1001', BillingMonth: '2026-11', MonthLabel: 'নভেম্বর ২০২৬', BillType: 'Monthly', Amount: 1000, PaidAmount: 1000, DueAmount: 0, Status: 'পরিশোধিত', GeneratedDate: '2026-11-01' },
+
       { BillID: 'BL-9003', CustomerID: 'NB-1002', BillingMonth: '2026-10', MonthLabel: 'অক্টোবর ২০২৬', BillType: 'Monthly', Amount: 800, PaidAmount: 800, DueAmount: 0, Status: 'পরিশোধিত', GeneratedDate: '2026-10-01' },
       { BillID: 'BL-9004', CustomerID: 'NB-1002', BillingMonth: '2026-11', MonthLabel: 'নভেম্বর ২০২৬', BillType: 'Monthly', Amount: 800, PaidAmount: 0, DueAmount: 800, Status: 'বকেয়া', GeneratedDate: '2026-11-01' },
+
       { BillID: 'BL-9005', CustomerID: 'NB-1003', BillingMonth: 'Opening', MonthLabel: 'পূর্বের বকেয়া', BillType: 'Opening', Amount: 500, PaidAmount: 0, DueAmount: 500, Status: 'বকেয়া', GeneratedDate: '2026-06-01' },
       { BillID: 'BL-9006', CustomerID: 'NB-1003', BillingMonth: '2026-10', MonthLabel: 'অক্টোবর ২০২৬', BillType: 'Monthly', Amount: 1500, PaidAmount: 1500, DueAmount: 0, Status: 'পরিশোধিত', GeneratedDate: '2026-10-01' },
       { BillID: 'BL-9007', CustomerID: 'NB-1003', BillingMonth: '2026-11', MonthLabel: 'নভেম্বর ২০২৬', BillType: 'Monthly', Amount: 1500, PaidAmount: 500, DueAmount: 1000, Status: 'আংশিক', GeneratedDate: '2026-11-01' },
+
       { BillID: 'BL-9008', CustomerID: 'NB-1004', BillingMonth: '2026-10', MonthLabel: 'অক্টোবর ২০২৬', BillType: 'Monthly', Amount: 500, PaidAmount: 0, DueAmount: 500, Status: 'বকেয়া', GeneratedDate: '2026-10-01' },
+
       { BillID: 'BL-9009', CustomerID: 'NB-1005', BillingMonth: '2026-11', MonthLabel: 'নভেম্বর ২০২৬', BillType: 'Monthly', Amount: 900, PaidAmount: 900, DueAmount: 0, Status: 'পরিশোধিত', GeneratedDate: '2026-11-01' },
+
       { BillID: 'BL-9010', CustomerID: 'NB-1006', BillingMonth: '2026-11', MonthLabel: 'নভেম্বর ২০২৬', BillType: 'Monthly', Amount: 400, PaidAmount: 0, DueAmount: 400, Status: 'বকেয়া', GeneratedDate: '2026-11-01' },
+
       { BillID: 'BL-9011', CustomerID: 'NB-1007', BillingMonth: '2026-10', MonthLabel: 'অক্টোবর ২০২৬', BillType: 'Monthly', Amount: 300, PaidAmount: 300, DueAmount: 0, Status: 'পরিশোধিত', GeneratedDate: '2026-10-01' },
       { BillID: 'BL-9012', CustomerID: 'NB-1007', BillingMonth: '2026-11', MonthLabel: 'নভেম্বর ২০২৬', BillType: 'Monthly', Amount: 300, PaidAmount: 0, DueAmount: 300, Status: 'বকেয়া', GeneratedDate: '2026-11-01' },
+
       { BillID: 'BL-9013', CustomerID: 'NB-1008', BillingMonth: '2026-11', MonthLabel: 'নভেম্বর ২০২৬', BillType: 'Monthly', Amount: 2500, PaidAmount: 2500, DueAmount: 0, Status: 'পরিশোধিত', GeneratedDate: '2026-11-01' },
+
       { BillID: 'BL-9014', CustomerID: 'NB-1010', BillingMonth: '2026-10', MonthLabel: 'অক্টোবর ২০২৬', BillType: 'Monthly', Amount: 1200, PaidAmount: 1200, DueAmount: 0, Status: 'পরিশোধিত', GeneratedDate: '2026-10-01' },
     ],
     collections: [
+      // Past 6 months collections (June 2026 - November 2026)
       { ReceiptID: 'P-601011', Date: '2026-06-12', CustomerID: 'NB-1001', CustomerName: 'মোঃ কামাল হোসেন', Area: 'মিরপুর ১০ (সেক্টর এ)', BillingMonth: '2026-06', Amount: 1000, PaymentMethod: 'Cash', TrxID: '', SenderAccount: '', CollectedBy: 'rafiq', CollectorRole: 'User', Note: 'জুন বিল', CreatedAt: '2026-06-12T11:00:00Z' },
       { ReceiptID: 'P-601012', Date: '2026-06-14', CustomerID: 'NB-1008', CustomerName: 'তানভীর হাসান', Area: 'মিরপুর ১০ (সেক্টর এ)', BillingMonth: '2026-06', Amount: 2500, PaymentMethod: 'Bank', TrxID: 'DBBL-884210', SenderAccount: '110-220-334', CollectedBy: 'admin', CollectorRole: 'Admin', Note: '', CreatedAt: '2026-06-14T14:20:00Z' },
       { ReceiptID: 'P-601013', Date: '2026-07-09', CustomerID: 'NB-1001', CustomerName: 'মোঃ কামাল হোসেন', Area: 'মিরপুর ১০ (সেক্টর এ)', BillingMonth: '2026-07', Amount: 1000, PaymentMethod: 'bKash', TrxID: 'BK7X29M1P', SenderAccount: '01715-112233', CollectedBy: 'Self-EBill', CollectorRole: 'Self-EBill', Note: '', CreatedAt: '2026-07-09T10:15:00Z' },
@@ -615,6 +717,9 @@ function ensureDb(): DatabaseSchema {
   if (!Array.isArray(parsed.smsLogs)) {
     parsed.smsLogs = [];
   }
+  if (!parsed.settings.DueReminder) {
+    parsed.settings.DueReminder = { ...DEFAULT_DUE_REMINDER };
+  }
   return parsed;
 }
 
@@ -630,166 +735,6 @@ function withLock<T>(fn: () => Promise<T> | T): Promise<T> {
   const next = lockPromise.then(() => fn(), () => fn());
   lockPromise = next.catch(() => {});
   return next;
-}
-
-function hardenCredentials(): void {
-  const db = ensureDb();
-  let changed = false;
-  const notices: string[] = [];
-
-  const envAdminPwd = (process.env.ADMIN_PASSWORD || '').trim();
-  const forceReset = process.env.RESET_ADMIN_PASSWORD === '1';
-
-  if (forceReset && envAdminPwd) {
-    assertStrongPassword(envAdminPwd, 'ADMIN_PASSWORD');
-    db.settings.AdminPassword = hashPassword(envAdminPwd);
-    changed = true;
-    notices.push(`[SECURITY] Admin password reset from ADMIN_PASSWORD for "${db.settings.AdminUsername}".`);
-  } else if (!db.settings.AdminPassword || (!isHashedPassword(db.settings.AdminPassword) && isWeakPasswordValue(db.settings.AdminPassword))) {
-    if (envAdminPwd && !isWeakPasswordValue(envAdminPwd)) {
-      db.settings.AdminPassword = hashPassword(envAdminPwd);
-      notices.push(`[SECURITY] Initialized Admin password from ADMIN_PASSWORD for "${db.settings.AdminUsername}".`);
-    } else {
-      const generated = generateStrongPassword();
-      db.settings.AdminPassword = hashPassword(generated);
-      notices.push(`[SECURITY] Generated Admin password for "${db.settings.AdminUsername}": ${generated}`);
-    }
-    changed = true;
-  } else if (!isHashedPassword(db.settings.AdminPassword)) {
-    db.settings.AdminPassword = hashPassword(db.settings.AdminPassword);
-    changed = true;
-  }
-
-  for (const col of db.collectors) {
-    if (!col.Password || (!isHashedPassword(col.Password) && isWeakPasswordValue(col.Password))) {
-      const generated = generateStrongPassword();
-      col.Password = hashPassword(generated);
-      changed = true;
-      notices.push(`[SECURITY] Generated password for collector "${col.Username}": ${generated}`);
-    } else if (!isHashedPassword(col.Password)) {
-      col.Password = hashPassword(col.Password);
-      changed = true;
-    }
-  }
-
-  if (
-    !db.settings.PaymentGatewayWebhookSecret ||
-    db.settings.PaymentGatewayWebhookSecret === DEMO_WEBHOOK_SECRET ||
-    db.settings.PaymentGatewayWebhookSecret.length < 16
-  ) {
-    const newSecret = generateWebhookSecret();
-    db.settings.PaymentGatewayWebhookSecret = newSecret;
-    changed = true;
-    notices.push(`[SECURITY] Generated PaymentGatewayWebhookSecret: ${newSecret}`);
-  }
-
-  if (changed) {
-    writeDbAtomic(db);
-  }
-  for (const msg of notices) {
-    console.log(msg);
-  }
-}
-
-// Session store with idle & absolute timeout + revocation
-interface SessionRecord {
-  user: SessionUser;
-  createdAt: number;
-  lastActiveAt: number;
-}
-
-const sessions = new Map<string, SessionRecord>();
-const IDLE_HOURS_RAW = Number(process.env.SESSION_IDLE_HOURS || 12);
-const SESSION_IDLE_MS = (Number.isFinite(IDLE_HOURS_RAW) && IDLE_HOURS_RAW > 0 ? IDLE_HOURS_RAW : 12) * 3600 * 1000;
-const SESSION_ABSOLUTE_MS = 7 * 24 * 3600 * 1000;
-
-function pruneExpiredSessions(now = Date.now()): void {
-  for (const [token, rec] of sessions.entries()) {
-    if (now - rec.lastActiveAt > SESSION_IDLE_MS || now - rec.createdAt > SESSION_ABSOLUTE_MS) {
-      sessions.delete(token);
-    }
-  }
-}
-
-function createSession(user: SessionUser): SessionUser {
-  const now = Date.now();
-  pruneExpiredSessions(now);
-  sessions.set(user.token, { user, createdAt: now, lastActiveAt: now });
-  return user;
-}
-
-function destroySession(token: string): void {
-  sessions.delete(token);
-}
-
-function revokeSessionsFor(role: 'Admin' | 'User', username?: string, exceptToken?: string): void {
-  for (const [token, rec] of sessions.entries()) {
-    if (exceptToken && token === exceptToken) continue;
-    if (rec.user.role === role && (!username || rec.user.username === username)) {
-      sessions.delete(token);
-    }
-  }
-}
-
-// In-memory Rate Limiter
-interface RateBucket {
-  count: number;
-  resetAt: number;
-}
-const rateBuckets = new Map<string, RateBucket>();
-
-function getClientIp(req: Request): string {
-  return req.ip || req.socket.remoteAddress || 'unknown';
-}
-
-function rateCheck(key: string, limit: number, windowMs: number): { allowed: boolean; retryAfterSec: number } {
-  const now = Date.now();
-  const existing = rateBuckets.get(key);
-  if (!existing || now >= existing.resetAt) {
-    return { allowed: true, retryAfterSec: 0 };
-  }
-  if (existing.count >= limit) {
-    return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((existing.resetAt - now) / 1000)) };
-  }
-  return { allowed: true, retryAfterSec: 0 };
-}
-
-function rateHit(key: string, limit: number, windowMs: number): { allowed: boolean; retryAfterSec: number } {
-  const now = Date.now();
-  if (rateBuckets.size > 5000) {
-    for (const [k, b] of rateBuckets.entries()) {
-      if (now >= b.resetAt) rateBuckets.delete(k);
-    }
-  }
-  let bucket = rateBuckets.get(key);
-  if (!bucket || now >= bucket.resetAt) {
-    bucket = { count: 0, resetAt: now + windowMs };
-    rateBuckets.set(key, bucket);
-  }
-  bucket.count += 1;
-  if (bucket.count > limit) {
-    return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((bucket.resetAt - now) / 1000)) };
-  }
-  return { allowed: true, retryAfterSec: 0 };
-}
-
-function rateReset(key: string): void {
-  rateBuckets.delete(key);
-}
-
-function rateLimit(prefix: string, limit: number, windowMs: number, keyFn?: (req: Request) => string) {
-  return (req: Request, res: Response, next: NextFunction) => {
-    const id = keyFn ? keyFn(req) : getClientIp(req);
-    const result = rateHit(`${prefix}:${id}`, limit, windowMs);
-    if (!result.allowed) {
-      res.setHeader('Retry-After', String(result.retryAfterSec));
-      res.status(429).json({
-        error: `অতিরিক্ত অনুরোধ পাঠানো হয়েছে। অনুগ্রহ করে ${toBnDigits(result.retryAfterSec)} সেকেন্ড পর আবার চেষ্টা করুন।`,
-      });
-      return;
-    }
-    next();
-  };
 }
 
 function computeCollectorSummaries(db: DatabaseSchema): CollectorSummary[] {
@@ -834,11 +779,14 @@ function computeAccountBalances(db: DatabaseSchema): AccountBalances {
 
   for (const col of db.collections) {
     if (col.PaymentMethod === 'Cash') {
+      // Only Admin direct Cash collections go immediately into Admin Office Cash.
+      // Collector Cash stays in Collector Hand Cash until deposited!
       if (col.CollectorRole === 'Admin') {
         accounts.Cash += col.Amount;
         totalIncome += col.Amount;
       }
     } else {
+      // Digital payments (bKash, Nagad, Rocket, Bank) go directly to Company Digital Accounts
       accounts[col.PaymentMethod] += col.Amount;
       totalIncome += col.Amount;
     }
@@ -880,36 +828,48 @@ interface CollectBillParams {
   date?: string;
 }
 
-function collectBillInternal(db: DatabaseSchema, params: CollectBillParams): Collection {
+function collectBillInternal(db: DatabaseSchema, rawParams: CollectBillParams): Collection {
+  const params: CollectBillParams = {
+    ...rawParams,
+    trxId: String(rawParams.trxId ?? '').trim(),
+    senderAccount: String(rawParams.senderAccount ?? '').trim().slice(0, 40),
+    note: String(rawParams.note ?? '').trim().slice(0, 300),
+  };
   const customer = db.customers.find((c) => c.CustomerID === params.customerId);
   if (!customer) {
-    throw new Error('গ্রাহক পাওয়া যায়নি।');
+    throw new Error('গ্রাহক পাওয়া যায়নি।');
   }
   const amount = Number(params.amount);
   if (!Number.isFinite(amount) || amount <= 0) {
     throw new Error('টাকার পরিমাণ অবশ্যই ০ এর বেশি হতে হবে।');
   }
-
-  const trimmedTrx = (params.trxId || '').trim();
-  if (params.paymentMethod !== 'Cash' && !trimmedTrx) {
-    throw new Error('ডিজিটাল পেমেন্টের জন্য TrxID / রেফারেন্স নম্বর আবশ্যক।');
+  if (amount > MAX_PAYMENT_AMOUNT) {
+    throw new Error('টাকার পরিমাণ অস্বাভাবিক বেশি। সঠিক পরিমাণ লিখুন।');
+  }
+  if (!ALLOWED_PAYMENT_METHODS.includes(params.paymentMethod)) {
+    throw new Error('পেমেন্টের মাধ্যম সঠিক নয়।');
   }
 
-  if (params.paymentMethod !== 'Cash' && trimmedTrx) {
-    const existingReceipt = db.collections.find(
-      (c) =>
-        c.PaymentMethod === params.paymentMethod &&
-        c.TrxID.trim().toLowerCase() === trimmedTrx.toLowerCase()
-    );
-    if (existingReceipt) {
-      throw new DuplicateTrxError(
-        `এই TrxID (${trimmedTrx}) দিয়ে ইতিমধ্যেই রিসিট ${existingReceipt.ReceiptID} সংরক্ষিত হয়েছে।`,
-        existingReceipt
-      );
+  if (params.paymentMethod !== 'Cash') {
+    if (!params.trxId) {
+      throw new Error('ডিজিটাল পেমেন্টের জন্য TrxID / রেফারেন্স নম্বর আবশ্যক।');
     }
+    if (!TRX_ID_PATTERN.test(params.trxId)) {
+      throw new Error('TrxID সঠিক নয় (৪–৪০ অক্ষর; শুধু ইংরেজি অক্ষর, সংখ্যা, - _ .)।');
+    }
+    const lower = params.trxId.toLowerCase();
+    if (db.collections.some((c) => c.PaymentMethod !== 'Cash' && String(c.TrxID).toLowerCase() === lower)) {
+      throw new DuplicateTrxError();
+    }
+  }
+  if (params.date && !/^\d{4}-\d{2}-\d{2}$/.test(params.date)) {
+    throw new Error('তারিখের ফরম্যাট সঠিক নয়।');
   }
 
   const targetMonth = params.billingMonth || todayStr().slice(0, 7);
+  if (!isValidBillingMonth(targetMonth)) {
+    throw new Error('বিলিং মাস সঠিক নয়।');
+  }
 
   if (targetMonth === 'Opening') {
     const openingBill = db.bills.find(
@@ -1009,11 +969,11 @@ function collectBillInternal(db: DatabaseSchema, params: CollectBillParams): Col
     BillingMonth: targetMonth,
     Amount: amount,
     PaymentMethod: params.paymentMethod,
-    TrxID: trimmedTrx,
-    SenderAccount: (params.senderAccount || '').trim(),
+    TrxID: params.trxId.trim(),
+    SenderAccount: params.senderAccount.trim(),
     CollectedBy: params.collectedBy,
     CollectorRole: params.collectorRole,
-    Note: (params.note || '').trim(),
+    Note: params.note.trim(),
     CreatedAt: new Date().toISOString(),
   };
 
@@ -1028,42 +988,301 @@ interface AuthedRequest extends Request {
 function authMiddleware(req: AuthedRequest, res: Response, next: NextFunction) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  const base = token ? sessions.get(token) : undefined;
+  const meta = token ? sessionMeta.get(token) : undefined;
   const now = Date.now();
-  const record = token ? sessions.get(token) : undefined;
-
-  if (!token || !record) {
-    res.status(401).json({ error: 'সেশন মেয়াদোত্তীর্ণ হয়েছে, অনুগ্রহ করে পুনরায় লগইন করুন।' });
+  const expired =
+    !base ||
+    !meta ||
+    now - meta.lastSeen > SESSION_IDLE_MS ||
+    now - meta.createdAt > SESSION_MAX_MS;
+  if (!token || expired || !base || !meta) {
+    if (token) destroySession(token);
+    res.status(401).json({ error: 'সেশন মেয়াদোত্তীর্ণ হয়েছে, অনুগ্রহ করে পুনরায় লগইন করুন।' });
     return;
   }
 
-  if (now - record.lastActiveAt > SESSION_IDLE_MS || now - record.createdAt > SESSION_ABSOLUTE_MS) {
-    destroySession(token);
-    res.status(401).json({ error: 'সেশনের সময়সীমা শেষ হয়েছে, অনুগ্রহ করে পুনরায় লগইন করুন।' });
-    return;
-  }
-
+  // Re-check the account on every request so deactivation / area changes apply immediately
   const db = ensureDb();
-  if (record.user.role === 'User') {
-    const col = db.collectors.find((c) => c.Username === record.user.username);
-    if (!col || col.Status !== 'এক্টিভ') {
+  let user: SessionUser = base;
+  if (base.role === 'Admin') {
+    if (base.username !== db.settings.AdminUsername) {
       destroySession(token);
-      res.status(401).json({ error: 'আপনার অ্যাকাউন্ট নিষ্ক্রিয় করা হয়েছে।' });
+      res.status(401).json({ error: 'সেশন মেয়াদোত্তীর্ণ হয়েছে, অনুগ্রহ করে পুনরায় লগইন করুন।' });
       return;
     }
-    record.user = {
-      ...record.user,
-      name: col.Name,
-      assignedAreas: col.AssignedAreas,
-    };
-  } else if (record.user.username !== db.settings.AdminUsername) {
-    destroySession(token);
-    res.status(401).json({ error: 'সেশন বৈধ নয়, অনুগ্রহ করে পুনরায় লগইন করুন।' });
-    return;
+  } else {
+    const col = db.collectors.find((c) => c.Username === base.username);
+    if (!col || col.Status !== 'এক্টিভ') {
+      destroySession(token);
+      res.status(401).json({ error: 'আপনার অ্যাকাউন্ট নিষ্ক্রিয় বা মুছে ফেলা হয়েছে।' });
+      return;
+    }
+    user = { ...base, name: col.Name, assignedAreas: col.AssignedAreas };
+  }
+  meta.lastSeen = now;
+  req.user = user;
+  next();
+}
+
+// ─────────────────────────────────────────────────────────────
+// ONE-TIME PAYMENT-LINK SMS + AUTOMATIC MONTHLY BILLS
+// Every customer gets ONE SMS with a permanent personal link. Whenever the customer opens that link it shows
+// the CURRENT dues (this month's bill, or "no due" once paid). New months' bills are created automatically,
+// so nothing has to be sent again.
+// ─────────────────────────────────────────────────────────────
+const DEFAULT_DUE_REMINDER: DueReminderConfig = {
+  Enabled: false,
+  SendHour: 10,
+  DeadlineDay: 10,
+  AutoGenerateBills: true,
+  Template:
+    'Dear {Name}, আপনার ইন্টারনেট বিল দেখতে ও পেমেন্ট করতে নিচের লিংকে ক্লিক করুন {PayLink} প্রতি মাসের ১ থেকে {DeadlineDay} তারিখের মধ্যে বিল পরিশোধ করুন। লিংকটি সংরক্ষণ করে রাখুন, প্রতি মাসে এই লিংকেই আপনার বিল দেখতে পাবেন। Thanks {Company}',
+};
+
+function getDueReminderConfig(settings: SettingsData): DueReminderConfig {
+  const raw: Partial<DueReminderConfig> = settings.DueReminder || {};
+  return {
+    Enabled: raw.Enabled ?? DEFAULT_DUE_REMINDER.Enabled,
+    SendHour: raw.SendHour ?? DEFAULT_DUE_REMINDER.SendHour,
+    DeadlineDay: raw.DeadlineDay ?? DEFAULT_DUE_REMINDER.DeadlineDay,
+    AutoGenerateBills: raw.AutoGenerateBills ?? DEFAULT_DUE_REMINDER.AutoGenerateBills,
+    Template: raw.Template || DEFAULT_DUE_REMINDER.Template,
+  };
+}
+
+interface ReminderState {
+  lastRunDate: string;
+  /** customerId → date the link SMS was sent (each customer gets it only once) */
+  linkSent: Record<string, string>;
+  /** month (YYYY-MM) for which bills were last generated automatically */
+  billsMonth: string;
+}
+
+function getReminderState(db: DatabaseSchema): ReminderState {
+  const s = (db.dueReminder || {}) as Partial<ReminderState>;
+  return { lastRunDate: s.lastRunDate || '', linkSent: s.linkSent || {}, billsMonth: s.billsMonth || '' };
+}
+
+/** Current date / hour in Bangladesh time, regardless of the server's own timezone. */
+function dhakaNow(): { date: string; hour: number } {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Dhaka',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date());
+  const get = (t: string) => parts.find((p) => p.type === t)?.value || '0';
+  return { date: `${get('year')}-${get('month')}-${get('day')}`, hour: Number(get('hour')) };
+}
+
+function getEnvBaseUrl(): string {
+  const env = (process.env.APP_URL || '').trim().replace(/\/+$/, '');
+  return /^https?:\/\/[^\s/]+/i.test(env) && !/MY_APP_URL/i.test(env) ? env : '';
+}
+
+/** Creates this month's bill for one customer if it doesn't exist yet. Returns true if created. */
+function ensureBillForCustomer(db: DatabaseSchema, cust: Customer, month: string, today: string): boolean {
+  if (cust.Status !== 'এক্টিভ' || !(cust.MonthlyBill > 0)) return false;
+  if (db.bills.some((b) => b.CustomerID === cust.CustomerID && b.BillingMonth === month)) return false;
+  db.bills.push({
+    BillID: randomId('BL'),
+    CustomerID: cust.CustomerID,
+    BillingMonth: month,
+    MonthLabel: getMonthLabelBn(month),
+    BillType: 'Monthly',
+    Amount: cust.MonthlyBill,
+    PaidAmount: 0,
+    DueAmount: cust.MonthlyBill,
+    Status: 'বকেয়া',
+    GeneratedDate: today,
+  });
+  cust.NextBillDate = addOneMonthStr(cust.NextBillDate || `${month}-01`);
+  return true;
+}
+
+function autoGenerateBillsForMonth(db: DatabaseSchema, month: string, today: string): number {
+  let created = 0;
+  for (const cust of db.customers) {
+    if (ensureBillForCustomer(db, cust, month, today)) created++;
+  }
+  return created;
+}
+
+/**
+ * Creates the new month's bills for all active customers (once per month; catches up if the server was down).
+ * Runs when the link feature is switched on, or when `force` is set (manual "send now").
+ */
+async function ensureMonthlyBills(force: boolean): Promise<number> {
+  const now = dhakaNow();
+  const month = now.date.slice(0, 7);
+  const db0 = ensureDb();
+  const cfg = getDueReminderConfig(db0.settings);
+  if (!cfg.AutoGenerateBills || !(force || cfg.Enabled)) return 0;
+  if (getReminderState(db0).billsMonth === month) return 0;
+  return withLock(() => {
+    const db = ensureDb();
+    const created = autoGenerateBillsForMonth(db, month, now.date);
+    const st = getReminderState(db);
+    st.billsMonth = month;
+    db.dueReminder = st;
+    writeDbAtomic(db);
+    return created;
+  });
+}
+
+/** When a customer opens the link and this month's bill is missing, create it, so the link is never out of date. */
+async function ensureCurrentBillFor(customerId: string): Promise<void> {
+  const now = dhakaNow();
+  const month = now.date.slice(0, 7);
+  const db0 = ensureDb();
+  const cfg = getDueReminderConfig(db0.settings);
+  if (!cfg.Enabled || !cfg.AutoGenerateBills) return;
+  const c0 = db0.customers.find((c) => c.CustomerID === customerId);
+  if (!c0 || db0.bills.some((b) => b.CustomerID === customerId && b.BillingMonth === month)) return;
+  await withLock(() => {
+    const db = ensureDb();
+    const c = db.customers.find((x) => x.CustomerID === customerId);
+    if (c && ensureBillForCustomer(db, c, month, now.date)) writeDbAtomic(db);
+  });
+}
+
+/** Active customers with a mobile number who have NOT received the link yet. */
+function computeLinkTargets(db: DatabaseSchema): Customer[] {
+  const sent = getReminderState(db).linkSent;
+  return db.customers.filter((c) => c.Status === 'এক্টিভ' && c.Mobile && !sent[c.CustomerID]);
+}
+
+function renderLinkMessage(
+  tpl: string,
+  c: Customer,
+  link: string,
+  company: string,
+  deadlineDay: number
+): string {
+  return tpl
+    .replace(/\{Name\}/g, () => c.Name)
+    .replace(/\{ID\}/g, () => c.CustomerID)
+    .replace(/\{DeadlineDay\}/g, () => toBnDigits(deadlineDay))
+    .replace(/\{PayLink\}/g, () => link)
+    .replace(/\{Company\}/g, () => company)
+    .slice(0, 480);
+}
+
+interface ReminderResult {
+  ok: boolean;
+  reason?: string;
+  date: string;
+  month: string;
+  eligible: number;
+  alreadySent: number;
+  generatedBills: number;
+  sent: number;
+  failed: number;
+  sample: string;
+  hasLink: boolean;
+}
+
+let reminderRunning = false;
+const reminderAttempts = new Map<string, number>();
+let warnedNoBaseUrlOn = '';
+
+async function markLinksSent(date: string, customers: Customer[]): Promise<void> {
+  await withLock(() => {
+    const db = ensureDb();
+    const st = getReminderState(db);
+    for (const c of customers) st.linkSent[c.CustomerID] = date;
+    st.lastRunDate = date;
+    db.dueReminder = st;
+    writeDbAtomic(db);
+  });
+}
+
+async function runDueReminders(opts: {
+  auto: boolean;
+  dryRun: boolean;
+  baseUrl: string;
+}): Promise<ReminderResult> {
+  const now = dhakaNow();
+  const month = now.date.slice(0, 7);
+  const db0 = ensureDb();
+  const cfg = getDueReminderConfig(db0.settings);
+  const state0 = getReminderState(db0);
+  const base: ReminderResult = {
+    ok: true,
+    date: now.date,
+    month,
+    eligible: 0,
+    alreadySent: db0.customers.filter((c) => state0.linkSent[c.CustomerID]).length,
+    generatedBills: 0,
+    sent: 0,
+    failed: 0,
+    sample: '',
+    hasLink: Boolean(opts.baseUrl),
+  };
+
+  if (opts.auto) {
+    if (!cfg.Enabled) return { ...base, ok: false, reason: 'disabled' };
+    if (now.hour < cfg.SendHour) return { ...base, ok: false, reason: 'too-early' };
+    if ((reminderAttempts.get(now.date) || 0) >= 3) return { ...base, ok: false, reason: 'max-attempts' };
   }
 
-  record.lastActiveAt = now;
-  req.user = record.user;
-  next();
+  const targets0 = computeLinkTargets(db0);
+  base.eligible = targets0.length;
+  if (cfg.AutoGenerateBills) {
+    const sim = JSON.parse(JSON.stringify(db0)) as DatabaseSchema;
+    base.generatedBills = getReminderState(db0).billsMonth === month ? 0 : autoGenerateBillsForMonth(sim, month, now.date);
+  }
+  const linkFor = (id: string) =>
+    opts.baseUrl ? `${opts.baseUrl}/?page=pay&cid=${encodeURIComponent(id)}` : '(APP_URL সেট করুন)';
+  const render = (c: Customer, link: string) =>
+    renderLinkMessage(cfg.Template, c, link, db0.settings.CompanyName, cfg.DeadlineDay);
+  if (targets0.length > 0) base.sample = render(targets0[0], linkFor(targets0[0].CustomerID));
+  if (opts.dryRun || targets0.length === 0) return base;
+
+  if (cfg.Template.includes('{PayLink}') && !opts.baseUrl) return { ...base, ok: false, reason: 'no-base-url' };
+  if (!db0.settings.SmsConfig?.Enabled) return { ...base, ok: false, reason: 'sms-disabled' };
+  if (reminderRunning) return { ...base, ok: false, reason: 'busy' };
+
+  reminderRunning = true;
+  try {
+    if (opts.auto) reminderAttempts.set(now.date, (reminderAttempts.get(now.date) || 0) + 1);
+
+    // Make sure this month's bills exist first, so the link shows what to pay
+    base.generatedBills = await ensureMonthlyBills(true);
+
+    const db1 = ensureDb();
+    const targets = computeLinkTargets(db1);
+    base.eligible = targets.length;
+    const succeeded: Customer[] = [];
+    for (const c of targets.slice(0, 500)) {
+      try {
+        const log = await dispatchSmsAndLog({
+          customerId: c.CustomerID,
+          customerName: c.Name,
+          mobile: c.Mobile,
+          receiptId: 'DUE-REMINDER',
+          message: render(c, linkFor(c.CustomerID)),
+          settings: db1.settings,
+          createId: randomId,
+          persistSmsLog,
+        });
+        if (log.Status === 'Failed') base.failed++;
+        else {
+          base.sent++;
+          succeeded.push(c);
+        }
+      } catch {
+        base.failed++;
+      }
+    }
+    if (succeeded.length > 0) await markLinksSent(now.date, succeeded);
+    return base;
+  } finally {
+    reminderRunning = false;
+  }
 }
 
 function requireAdmin(req: AuthedRequest, res: Response, next: NextFunction) {
@@ -1089,6 +1308,11 @@ async function persistSmsLog(logEntry: SmsLog): Promise<void> {
   });
 }
 
+/**
+ * Unified backend payment processor for the 'Collections' store.
+ * Atomically records the receipt + reconciles bills, then automatically triggers
+ * `onCollectionPaymentProcessed` to format and dispatch the Bengali confirmation SMS.
+ */
 async function processCollectionPayment(options: {
   prepareAndValidate?: (db: DatabaseSchema) => {
     params: CollectBillParams;
@@ -1131,99 +1355,155 @@ async function processCollectionPayment(options: {
   return { receipt: committed.receipt, smsLog };
 }
 
-function daysBetweenDates(dateA: string, dateB: string): number {
-  const a = Date.parse(`${dateA}T00:00:00Z`);
-  const b = Date.parse(`${dateB}T00:00:00Z`);
-  if (Number.isNaN(a) || Number.isNaN(b)) return Number.NaN;
-  return Math.round((a - b) / (24 * 3600 * 1000));
-}
+/**
+ * Runs once at startup:
+ *  - replaces default / empty passwords with strong ones (printed ONCE in the server console)
+ *  - hashes any plain-text password left over from older versions
+ *  - replaces the demo / missing webhook secret with a random one (visible to the admin in Settings)
+ */
+function hardenCredentials(): void {
+  const db = ensureDb();
+  let changed = false;
+  const notices: string[] = [];
 
-const BLOCKED_PATH_PATTERNS = [
-  /^\/data(?:\/|$)/i,
-  /^\/server(?:\/|$)/i,
-  /^\/@fs(?:\/|$)/i,
-  /^\/\.env/i,
-  /^\/\.git/i,
-  /^\/server\.ts$/i,
-  /^\/package(?:-lock)?\.json$/i,
-  /^\/bun\.lock$/i,
-  /^\/tsconfig\.json$/i,
-  /^\/vite\.config\.ts$/i,
-  /^\/metadata\.json$/i,
-];
+  const envPw = (process.env.ADMIN_PASSWORD || '').trim();
+  const envPwOk = envPw.length >= MIN_PASSWORD_LENGTH && !WEAK_PASSWORDS.includes(envPw.toLowerCase());
+  const forceReset = ['1', 'true'].includes(String(process.env.RESET_ADMIN_PASSWORD || '').toLowerCase());
 
-async function startServer() {
-  ensureDb();
-  hardenCredentials();
-
-  const app = express();
-  const isProd = process.env.NODE_ENV === 'production' || process.argv.includes('--prod');
-
-  if (process.env.TRUST_PROXY === '1') {
-    app.set('trust proxy', 1);
+  // ---- Admin ----
+  const adminStored = db.settings.AdminPassword;
+  const adminIsDefault =
+    !adminStored || DEFAULT_ADMIN_PASSWORDS.some((p) => verifyPassword(p, adminStored));
+  if (forceReset && envPwOk) {
+    db.settings.AdminPassword = hashPassword(envPw);
+    changed = true;
+    notices.push(`অ্যাডমিন (${db.settings.AdminUsername}) পাসওয়ার্ড .env-এর ADMIN_PASSWORD দিয়ে রিসেট করা হয়েছে।`);
+  } else if (adminIsDefault) {
+    const pw = envPwOk ? envPw : generatePassword();
+    db.settings.AdminPassword = hashPassword(pw);
+    changed = true;
+    notices.push(
+      envPwOk
+        ? `অ্যাডমিন (${db.settings.AdminUsername}) পাসওয়ার্ড .env-এর ADMIN_PASSWORD থেকে সেট হয়েছে।`
+        : `অ্যাডমিন লগইন → ইউজারনেম: ${db.settings.AdminUsername}   পাসওয়ার্ড: ${pw}`
+    );
+  } else if (!isHashedPassword(adminStored)) {
+    db.settings.AdminPassword = hashPassword(adminStored);
+    changed = true;
   }
 
-  // Optional HTTPS Enforcement
-  if (process.env.FORCE_HTTPS === '1') {
+  // ---- Collectors ----
+  for (const col of db.collectors) {
+    const stored = col.Password;
+    const isDefault =
+      !stored || DEFAULT_COLLECTOR_PASSWORDS.some((p) => verifyPassword(p, stored));
+    if (isDefault) {
+      const pw = generatePassword();
+      col.Password = hashPassword(pw);
+      changed = true;
+      notices.push(`কালেক্টর লগইন → ইউজারনেম: ${col.Username}   পাসওয়ার্ড: ${pw}`);
+    } else if (!isHashedPassword(stored)) {
+      col.Password = hashPassword(stored);
+      changed = true;
+    }
+  }
+
+  // ---- Webhook secret ----
+  const secret = db.settings.PaymentGatewayWebhookSecret || '';
+  if (secret.length < 16 || secret === DEMO_WEBHOOK_SECRET) {
+    db.settings.PaymentGatewayWebhookSecret = crypto.randomBytes(24).toString('hex');
+    changed = true;
+    notices.push('ওয়েবহুক সিক্রেট নতুন করে তৈরি হয়েছে (অ্যাডমিন → সেটিংস থেকে দেখা যাবে)।');
+  }
+
+  if (changed) {
+    writeDbAtomic(db);
+  }
+  if (notices.length > 0) {
+    console.log('\n================ NetBill ISP · নিরাপত্তা সেটআপ ================');
+    for (const n of notices) console.log(`  • ${n}`);
+    console.log('  এই পাসওয়ার্ডগুলো শুধু এই একবারই দেখানো হচ্ছে — লগইন করে নিজের পাসওয়ার্ড দিন।');
+    console.log('==============================================================\n');
+  }
+}
+
+async function startServer() {
+  hardenCredentials();
+  const app = express();
+  app.disable('x-powered-by');
+  if (process.env.TRUST_PROXY) {
+    // Needed so req.ip / req.secure are correct behind Nginx, Caddy, Cloud Run, etc.
+    app.set('trust proxy', Number(process.env.TRUST_PROXY) || 1);
+  }
+
+  // Optional HTTPS redirect (only when running behind a TLS-terminating proxy)
+  if (IS_PROD && process.env.FORCE_HTTPS === '1' && process.env.TRUST_PROXY) {
     app.use((req, res, next) => {
-      const proto = req.headers['x-forwarded-proto'];
-      if (!req.secure && proto !== 'https') {
-        res.redirect(301, `https://${req.headers.host}${req.originalUrl}`);
+      if (req.secure) {
+        next();
         return;
       }
-      next();
+      res.redirect(301, `https://${req.headers.host}${req.originalUrl}`);
     });
   }
 
-  // Security Headers
+  // Security headers
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+    // Off by default because AI Studio shows the app inside an iframe. Set BLOCK_FRAMING=1 for production.
     if (process.env.BLOCK_FRAMING === '1') {
       res.setHeader('X-Frame-Options', 'DENY');
-      res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
     }
     if (req.path.startsWith('/api/')) {
       res.setHeader('Cache-Control', 'no-store');
     }
+    if (IS_PROD && req.secure) {
+      res.setHeader('Strict-Transport-Security', 'max-age=15552000; includeSubDomains');
+    }
     next();
   });
 
-  // Block direct access to internal files, database directory, and source configs
+  // Never serve server-side files. In dev mode Vite serves the whole project folder,
+  // which would otherwise expose data/netbill-db.json (all customers!) and the server source.
+  const BLOCKED_PATHS =
+    /^\/(data|server|\.git|\.env[^/]*|\.vite)(\/|$)|^\/(server\.ts|package(-lock)?\.json|tsconfig\.json|vite\.config\.ts|metadata\.json|readme\.md|security-changes\.md|\.gitignore)$/i;
   app.use((req, res, next) => {
-    const cleanPath = req.path || '/';
-    if (BLOCKED_PATH_PATTERNS.some((re) => re.test(cleanPath))) {
-      res.status(404).end();
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(req.path);
+    } catch {
+      res.status(400).send('Bad request');
+      return;
+    }
+    if (decoded.includes('\0')) {
+      res.status(400).send('Bad request');
+      return;
+    }
+    const normalized = path.posix.normalize(decoded.replace(/\\/g, '/'));
+    if (normalized.startsWith('/@fs/') || BLOCKED_PATHS.test(normalized) || /\/\.env/i.test(normalized)) {
+      res.status(404).send('Not found');
       return;
     }
     next();
   });
 
-  app.use(express.json({ limit: '512kb' }));
+  app.use(express.json({ limit: '2mb' }));
 
-  // Public Auth with Rate Limiting
+  // Public Auth (rate limited, hashed passwords, uniform timing)
   app.post('/api/auth/login', async (req, res) => {
-    const ip = getClientIp(req);
-    const ipCheck = rateCheck(`login-ip:${ip}`, 20, 15 * 60 * 1000);
-    if (!ipCheck.allowed) {
-      res.setHeader('Retry-After', String(ipCheck.retryAfterSec));
-      res.status(429).json({
-        error: `অতিরিক্ত লগইন প্রচেষ্টা করা হয়েছে। ${toBnDigits(ipCheck.retryAfterSec)} সেকেন্ড পর চেষ্টা করুন।`,
-      });
-      return;
-    }
+    const body = (req.body || {}) as { username?: unknown; password?: unknown };
+    const u = typeof body.username === 'string' ? body.username.trim().slice(0, 64) : '';
+    const p = typeof body.password === 'string' ? body.password.slice(0, 200) : '';
 
-    const { username, password } = req.body as { username?: string; password?: string };
-    const u = (username || '').trim();
-    const p = password || '';
-    const userIpKey = `login-user-ip:${u.toLowerCase()}:${ip}`;
-
-    const userIpCheck = rateCheck(userIpKey, 5, 15 * 60 * 1000);
-    if (!userIpCheck.allowed) {
-      res.setHeader('Retry-After', String(userIpCheck.retryAfterSec));
+    const ipKey = `login-fail-ip:${req.ip}`;
+    const pairKey = `login-fail-pair:${req.ip}|${u.toLowerCase()}`;
+    const wait = Math.max(rateCheck(ipKey, 20), rateCheck(pairKey, 5));
+    if (wait > 0) {
+      res.setHeader('Retry-After', String(wait));
       res.status(429).json({
-        error: `ভুল পাসওয়ার্ডের কারণে সাময়িকভাবে ব্লক করা হয়েছে। ${toBnDigits(userIpCheck.retryAfterSec)} সেকেন্ড পর চেষ্টা করুন।`,
+        error: `অনেকবার ভুল চেষ্টা করা হয়েছে। ${Math.ceil(wait / 60)} মিনিট পর আবার চেষ্টা করুন।`,
       });
       return;
     }
@@ -1231,19 +1511,21 @@ async function startServer() {
     const db = ensureDb();
     let sessionUser: SessionUser | null = null;
 
-    if (u === db.settings.AdminUsername && verifyPassword(p, db.settings.AdminPassword)) {
-      sessionUser = {
-        token: crypto.randomUUID(),
-        role: 'Admin',
-        username: u,
-        name: 'অ্যাডমিনিস্ট্রেটর',
-        assignedAreas: [],
-      };
+    if (u && u === db.settings.AdminUsername) {
+      if (verifyPassword(p, db.settings.AdminPassword)) {
+        sessionUser = {
+          token: crypto.randomUUID(),
+          role: 'Admin',
+          username: u,
+          name: 'অ্যাডমিনিস্ট্রেটর',
+          assignedAreas: [],
+        };
+      }
     } else {
-      const col = db.collectors.find(
-        (c) => c.Username === u && c.Status === 'এক্টিভ' && verifyPassword(p, c.Password)
-      );
-      if (col) {
+      const col = db.collectors.find((c) => c.Username === u);
+      // Always run one hash verification so response time doesn't reveal valid usernames
+      const ok = verifyPassword(p, col ? col.Password : DUMMY_HASH);
+      if (col && ok && col.Status === 'এক্টিভ') {
         sessionUser = {
           token: crypto.randomUUID(),
           role: 'User',
@@ -1254,15 +1536,14 @@ async function startServer() {
       }
     }
 
-    rateHit(`login-ip:${ip}`, 20, 15 * 60 * 1000);
-
     if (!sessionUser) {
-      rateHit(userIpKey, 5, 15 * 60 * 1000);
-      res.status(401).json({ error: 'ভুল ইউজারনেম অথবা পাসওয়ার্ড। অনুগ্রহ করে আবার চেষ্টা করুন।' });
+      rateHit(ipKey, 15 * 60_000);
+      rateHit(pairKey, 15 * 60_000);
+      res.status(401).json({ error: 'ভুল ইউজারনেম অথবা পাসওয়ার্ড। অনুগ্রহ করে আবার চেষ্টা করুন।' });
       return;
     }
 
-    rateReset(userIpKey);
+    rateClear(pairKey);
     createSession(sessionUser);
     res.json({ user: sessionUser });
   });
@@ -1278,20 +1559,10 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  // Public E-Billing Portal Endpoints (Exact lookup + Data masking + Rate limited)
-  app.get('/api/public/lookup', rateLimit('public-lookup', 40, 60 * 1000), (req, res) => {
-    const ip = getClientIp(req);
-    const missCheck = rateCheck(`lookup-miss:${ip}`, 10, 10 * 60 * 1000);
-    if (!missCheck.allowed) {
-      res.setHeader('Retry-After', String(missCheck.retryAfterSec));
-      res.status(429).json({
-        error: `অনেকবার ভুল তথ্য দিয়ে খোঁজা হয়েছে। ${toBnDigits(missCheck.retryAfterSec)} সেকেন্ড পর আবার চেষ্টা করুন।`,
-      });
-      return;
-    }
-
-    const q = String(req.query.q || '').trim();
-    const qLower = q.toLowerCase();
+  // Public E-Billing Portal Endpoints (No Login Required)
+  // → rate limited, exact-match lookup, minimal data returned
+  app.get('/api/public/lookup', rateLimit('lookup', 40, 60_000), async (req, res) => {
+    const q = String(req.query.q || '').trim().toLowerCase().slice(0, 40);
     const db = ensureDb();
     const {
       CompanyName,
@@ -1318,140 +1589,138 @@ async function startServer() {
       RocketNumber,
       BankDetails,
     };
+    const empty = {
+      company,
+      customer: null,
+      dueBills: [],
+      totalDue: 0,
+      lastPayment: null,
+      recentRequests: [],
+    };
 
     if (!q) {
-      res.json({
-        company,
-        customer: null,
-        dueBills: [],
-        totalDue: 0,
-        lastPayment: null,
-        recentRequests: [],
-      });
+      res.json(empty);
       return;
     }
 
-    const qDigits = normalizeMobileDigits(q);
+    // Extra-strict limit on lookups that find nothing (blocks ID / number guessing)
+    const missKey = `lookup-miss:${req.ip}`;
+    const wait = rateCheck(missKey, 10);
+    if (wait > 0) {
+      res.setHeader('Retry-After', String(wait));
+      res.status(429).json({ error: 'অনেকবার ভুল তথ্য দেওয়া হয়েছে। কিছুক্ষণ পর আবার চেষ্টা করুন।' });
+      return;
+    }
+
+    // Exact match only: full customer ID, or the FULL mobile number (not just last digits)
+    const qMobile = normalizeMobile(q);
     const customer =
       db.customers.find(
         (c) =>
-          c.CustomerID.toLowerCase() === qLower ||
-          (qDigits.length >= 10 && normalizeMobileDigits(c.Mobile) === qDigits)
+          c.CustomerID.toLowerCase() === q ||
+          (qMobile.length >= 10 && normalizeMobile(c.Mobile) === qMobile)
       ) || null;
 
     if (!customer) {
-      rateHit(`lookup-miss:${ip}`, 10, 10 * 60 * 1000);
-      res.json({
-        company,
-        customer: null,
-        dueBills: [],
-        totalDue: 0,
-        lastPayment: null,
-        recentRequests: [],
-      });
+      rateHit(missKey, 10 * 60_000);
+      res.json(empty);
       return;
     }
 
-    rateReset(`lookup-miss:${ip}`);
-
-    const maskedCustomer: Customer = {
-      ...customer,
-      Mobile: maskMobile(customer.Mobile),
-      Address: '',
-      Note: '',
-      OpeningBalance: 0,
-    };
-
-    const dueBills = db.bills.filter(
-      (b) => b.CustomerID === customer.CustomerID && b.DueAmount > 0
-    );
+    // The link always shows the CURRENT situation: make sure this month's bill exists, then list what is unpaid
+    await ensureCurrentBillFor(customer.CustomerID);
+    const fresh = ensureDb();
+    const monthKey = (b: { BillingMonth: string }) => (b.BillingMonth === 'Opening' ? '0000-00' : b.BillingMonth);
+    const dueBills = fresh.bills
+      .filter((b) => b.CustomerID === customer.CustomerID && b.DueAmount > 0)
+      .sort((a, b) => monthKey(a).localeCompare(monthKey(b)));
     const totalDue = dueBills.reduce((s, b) => s + b.DueAmount, 0);
-
-    const rawLastPayment =
-      db.collections.find((c) => c.CustomerID === customer.CustomerID) || null;
-    const lastPayment = rawLastPayment
-      ? {
-          ...rawLastPayment,
-          TrxID: maskTrx(rawLastPayment.TrxID),
-          SenderAccount: '',
-          CollectedBy: '',
-          Note: '',
-        }
-      : null;
-
-    const recentRequests = db.ePayments
-      .filter((e) => e.CustomerID === customer.CustomerID)
-      .slice(0, 5)
-      .map((r) => ({
-        ...r,
-        Mobile: maskMobile(r.Mobile),
-        SenderNumberOrAccount: maskMobile(r.SenderNumberOrAccount),
-        TrxID: maskTrx(r.TrxID),
-      }));
+    const last = fresh.collections.find((c) => c.CustomerID === customer.CustomerID) || null;
+    const recent = fresh.ePayments.filter((e) => e.CustomerID === customer.CustomerID).slice(0, 5);
 
     res.json({
       company,
-      customer: maskedCustomer,
+      customer: {
+        CustomerID: customer.CustomerID,
+        Name: customer.Name,
+        Area: customer.Area,
+        Package: customer.Package,
+        ServiceType: customer.ServiceType,
+        MonthlyBill: customer.MonthlyBill,
+        Status: customer.Status,
+        Mobile: maskMobile(customer.Mobile),
+      },
       dueBills,
       totalDue,
-      lastPayment,
-      recentRequests,
+      lastPayment: last
+        ? {
+            ReceiptID: last.ReceiptID,
+            Date: last.Date,
+            BillingMonth: last.BillingMonth,
+            Amount: last.Amount,
+            PaymentMethod: last.PaymentMethod,
+          }
+        : null,
+      recentRequests: recent.map((e) => ({
+        RequestID: e.RequestID,
+        SubmittedAt: e.SubmittedAt,
+        BillingMonth: e.BillingMonth,
+        Amount: e.Amount,
+        PaymentMethod: e.PaymentMethod,
+        TrxID: maskTrx(e.TrxID),
+        Status: e.Status,
+      })),
     });
   });
 
-  app.post('/api/public/epayment', rateLimit('public-epay', 8, 10 * 60 * 1000), async (req, res) => {
+  app.post('/api/public/epayment', rateLimit('epay', 8, 10 * 60_000), async (req, res) => {
     try {
       const result = await withLock(() => {
         const db = ensureDb();
-        const {
-          customerId,
-          billingMonth,
-          amount,
-          paymentMethod,
-          senderNumberOrAccount,
-          trxId,
-          note,
-        } = req.body as {
-          customerId: string;
-          billingMonth: string;
-          amount: number;
-          paymentMethod: Exclude<PaymentMethod, 'Cash'>;
-          senderNumberOrAccount: string;
-          trxId: string;
-          note?: string;
-        };
+        const b = (req.body || {}) as Record<string, unknown>;
+        const customerId = String(b.customerId ?? '').trim();
+        const billingMonth = String(b.billingMonth ?? '').trim();
+        const amount = Number(b.amount);
+        const paymentMethod = String(b.paymentMethod ?? '');
+        const sender = String(b.senderNumberOrAccount ?? '').trim();
+        const trxId = String(b.trxId ?? '').trim();
+        const note = String(b.note ?? '').trim().slice(0, 200);
 
         const customer = db.customers.find((c) => c.CustomerID === customerId);
-        if (!customer) throw new Error('সঠিক গ্রাহক আইডি পাওয়া যায়নি।');
-
-        const pendingForCust = db.ePayments.filter(
-          (e) => e.CustomerID === customer.CustomerID && e.Status === 'Pending'
-        ).length;
-        if (pendingForCust >= 5) {
-          throw new Error(
-            'এই গ্রাহকের ইতিমধ্যেই ৫টি অপেক্ষমাণ ই-পেমেন্ট অনুরোধ রয়েছে। অনুগ্রহ করে অফিস যাচাইয়ের জন্য অপেক্ষা করুন।'
-          );
-        }
-
-        const allowedDigital: Exclude<PaymentMethod, 'Cash'>[] = ['bKash', 'Nagad', 'Rocket', 'Bank'];
-        if (!allowedDigital.includes(paymentMethod)) {
-          throw new Error('সঠিক ডিজিটাল পেমেন্ট মাধ্যম নির্বাচন করুন।');
-        }
-
-        const numAmt = Number(amount);
-        if (!Number.isFinite(numAmt) || numAmt <= 0 || numAmt > 500000) {
+        if (!customer) throw new Error('সঠিক গ্রাহক আইডি পাওয়া যায়নি।');
+        if (!Number.isFinite(amount) || amount <= 0 || amount > MAX_PAYMENT_AMOUNT) {
           throw new Error('সঠিক টাকার পরিমাণ লিখুন।');
         }
-        if (!senderNumberOrAccount?.trim() || senderNumberOrAccount.includes('*')) {
-          throw new Error('প্রেরকের সঠিক মোবাইল বা ব্যাংক অ্যাকাউন্ট নম্বর লিখুন।');
+        if (!PUBLIC_PAYMENT_METHODS.includes(paymentMethod)) {
+          throw new Error('পেমেন্টের মাধ্যম সঠিক নয়।');
         }
-        if (!trxId?.trim()) throw new Error('TrxID বা রেফারেন্স নম্বর আবশ্যক।');
+        if (billingMonth && !isValidBillingMonth(billingMonth)) {
+          throw new Error('বিলিং মাস সঠিক নয়।');
+        }
+        if (!sender || sender.length > 40) {
+          throw new Error('প্রেরকের নম্বর বা অ্যাকাউন্ট নম্বর লিখুন।');
+        }
+        if (!TRX_ID_PATTERN.test(trxId)) {
+          throw new Error('TrxID সঠিক নয় (৪–৪০ অক্ষর; শুধু ইংরেজি অক্ষর, সংখ্যা, - _ .)।');
+        }
 
-        const dupTrx = db.ePayments.find(
-          (e) => e.TrxID.toLowerCase() === trxId.trim().toLowerCase() && e.Status !== 'Rejected'
+        const lower = trxId.toLowerCase();
+        const dupReq = db.ePayments.find(
+          (e) => e.TrxID.toLowerCase() === lower && e.Status !== 'Rejected'
         );
-        if (dupTrx) {
-          throw new Error('এই TrxID দিয়ে ইতিমধ্যেই একটি অনুরোধ জমা দেওয়া হয়েছে।');
+        const dupRec = db.collections.find(
+          (c) => c.PaymentMethod !== 'Cash' && c.TrxID.toLowerCase() === lower
+        );
+        if (dupReq || dupRec) {
+          throw new Error('এই TrxID দিয়ে ইতিমধ্যেই একটি অনুরোধ জমা দেওয়া হয়েছে।');
+        }
+
+        const pendingAll = db.ePayments.filter((e) => e.Status === 'Pending');
+        if (pendingAll.filter((e) => e.CustomerID === customer.CustomerID).length >= 5) {
+          throw new Error('এই গ্রাহকের ৫টি অনুরোধ যাচাইয়ের অপেক্ষায় আছে। যাচাই শেষ হওয়া পর্যন্ত অপেক্ষা করুন।');
+        }
+        if (pendingAll.length >= 1000) {
+          throw new Error('সিস্টেম এখন ব্যস্ত। কিছুক্ষণ পর আবার চেষ্টা করুন।');
         }
 
         const reqRow: EPaymentRequest = {
@@ -1461,79 +1730,77 @@ async function startServer() {
           CustomerName: customer.Name,
           Mobile: customer.Mobile,
           BillingMonth: billingMonth || todayStr().slice(0, 7),
-          Amount: numAmt,
-          PaymentMethod: paymentMethod,
-          SenderNumberOrAccount: senderNumberOrAccount.trim(),
-          TrxID: trxId.trim(),
+          Amount: amount,
+          PaymentMethod: paymentMethod as Exclude<PaymentMethod, 'Cash'>,
+          SenderNumberOrAccount: sender,
+          TrxID: trxId,
           Status: 'Pending',
           ReviewedBy: '',
           ReviewedAt: '',
-          Note: (note || '').trim().slice(0, 200),
+          Note: note,
         };
 
         db.ePayments.unshift(reqRow);
         writeDbAtomic(db);
-
-        return {
-          ...reqRow,
-          Mobile: maskMobile(reqRow.Mobile),
-        };
+        return reqRow;
       });
-      res.json({ request: result });
+      // Don't echo internal fields (e.g. the customer's full mobile) back to the public caller
+      res.json({ request: { ...result, Mobile: maskMobile(result.Mobile) } });
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }
   });
 
-  // Automated Payment Gateway IPN / Webhook Hook (Timing-safe + Rate-limited + Idempotent)
-  app.post('/api/webhook/epayment', async (req, res) => {
-    const ip = getClientIp(req);
-    const failCheck = rateCheck(`webhook-fail:${ip}`, 10, 15 * 60 * 1000);
-    if (!failCheck.allowed) {
-      res.setHeader('Retry-After', String(failCheck.retryAfterSec));
-      res.status(429).json({ error: 'Too many failed webhook attempts' });
+  // Automated Payment Gateway IPN / Webhook Hook
+  // → timing-safe secret check, failure lockout, strict validation, replay-safe (duplicate TrxID)
+  app.post('/api/webhook/epayment', rateLimit('webhook', 120, 60_000), async (req, res) => {
+    const failKey = `webhook-fail:${req.ip}`;
+    const wait = rateCheck(failKey, 10);
+    if (wait > 0) {
+      res.setHeader('Retry-After', String(wait));
+      res.status(429).json({ error: 'Too many failed attempts' });
       return;
     }
-
-    const secret = String(req.headers['x-webhook-secret'] || req.body?.secret || '');
-    const dbSnap = ensureDb();
-    const storedSecret = dbSnap.settings.PaymentGatewayWebhookSecret || '';
-
-    if (
-      !storedSecret ||
-      storedSecret.length < 16 ||
-      storedSecret === DEMO_WEBHOOK_SECRET ||
-      !secret ||
-      !safeEqual(secret, storedSecret)
-    ) {
-      rateHit(`webhook-fail:${ip}`, 10, 15 * 60 * 1000);
-      res.status(401).json({ error: 'Invalid webhook secret' });
-      return;
-    }
-
-    rateReset(`webhook-fail:${ip}`);
-
     try {
+      const body = (req.body || {}) as Record<string, unknown>;
+      const provided = String(req.headers['x-webhook-secret'] || body.secret || '');
       const { receipt, smsLog } = await processCollectionPayment({
         prepareAndValidate: (db) => {
-          const { customerId, trxId, amount, paymentMethod, senderAccount, billingMonth } = req.body;
+          const configured = db.settings.PaymentGatewayWebhookSecret || '';
+          if (configured.length < 16) {
+            throw new Error('Webhook is disabled until a strong secret (16+ chars) is set in Settings');
+          }
+          if (!provided || !safeEqual(provided, configured)) {
+            throw new WebhookAuthError();
+          }
+
+          const customerId = String(body.customerId ?? '').trim();
+          const trxId = String(body.trxId ?? '').trim();
+          if (!customerId) throw new Error('customerId is required');
+          if (!TRX_ID_PATTERN.test(trxId)) throw new Error('trxId is invalid');
+
           const pending = db.ePayments.find(
             (e) =>
               e.CustomerID === customerId &&
-              e.TrxID.toLowerCase() === String(trxId || '').toLowerCase() &&
+              e.TrxID.toLowerCase() === trxId.toLowerCase() &&
               e.Status === 'Pending'
           );
+          const method = String(body.paymentMethod || pending?.PaymentMethod || 'bKash');
+          if (!PUBLIC_PAYMENT_METHODS.includes(method)) throw new Error('paymentMethod is invalid');
+          const billingMonth = String(body.billingMonth || pending?.BillingMonth || todayStr().slice(0, 7));
+          if (!isValidBillingMonth(billingMonth)) throw new Error('billingMonth is invalid');
+
           return {
             params: {
               customerId,
-              billingMonth: billingMonth || pending?.BillingMonth || todayStr().slice(0, 7),
-              amount: Number(amount || pending?.Amount || 0),
-              paymentMethod: paymentMethod || pending?.PaymentMethod || 'bKash',
-              trxId: String(trxId || ''),
-              senderAccount: String(senderAccount || pending?.SenderNumberOrAccount || ''),
+              billingMonth,
+              amount: Number(body.amount || pending?.Amount || 0),
+              paymentMethod: method as PaymentMethod,
+              trxId,
+              senderAccount: String(body.senderAccount || pending?.SenderNumberOrAccount || '').slice(0, 40),
               collectedBy: 'AutoWebhook',
               collectorRole: 'Self-EBill',
-              note: 'স্বয়ংক্রিয় গেটওয়ে ভেরিফিকেশন',
+              note: 'স্বয়ংক্রিয় গেটওয়ে ভেরিফিকেশন',
             },
             afterInsert: () => {
               if (pending) {
@@ -1548,8 +1815,14 @@ async function startServer() {
 
       res.json({ ok: true, receipt, smsLog });
     } catch (err) {
+      if (err instanceof WebhookAuthError) {
+        rateHit(failKey, 10 * 60_000);
+        res.status(401).json({ error: 'Invalid webhook secret' });
+        return;
+      }
       if (err instanceof DuplicateTrxError) {
-        res.json({ ok: true, duplicate: true, receipt: err.existingReceipt });
+        // Idempotent: a gateway retry of an already-recorded payment is acknowledged, not re-credited
+        res.json({ ok: true, duplicate: true });
         return;
       }
       res.status(400).json({ error: (err as Error).message });
@@ -1561,6 +1834,8 @@ async function startServer() {
     const db = ensureDb();
     const user = req.user!;
     const { AdminPassword: _hiddenPwd, ...safeSettings } = db.settings;
+    // Collectors must never receive the webhook secret or the admin username
+    const collectorSettings = { ...safeSettings, PaymentGatewayWebhookSecret: '', AdminUsername: '' };
     const smsEnvStatus = getSmsEnvStatus();
 
     if (user.role === 'Admin') {
@@ -1582,13 +1857,7 @@ async function startServer() {
       return;
     }
 
-    // Collector (User): omit AdminUsername & PaymentGatewayWebhookSecret
-    const collectorSafeSettings = {
-      ...safeSettings,
-      AdminUsername: '',
-      PaymentGatewayWebhookSecret: '',
-    };
-
+    // Collector (User) strictly scoped to AssignedAreas
     const allowedSet = new Set(user.assignedAreas);
     const scopedCustomers = db.customers.filter((c) => allowedSet.has(c.Area));
     const scopedCustIds = new Set(scopedCustomers.map((c) => c.CustomerID));
@@ -1603,7 +1872,7 @@ async function startServer() {
     );
 
     res.json({
-      settings: collectorSafeSettings,
+      settings: collectorSettings,
       areas: db.areas.filter((a) => allowedSet.has(a.AreaName)),
       collectors: [],
       customers: scopedCustomers,
@@ -1705,34 +1974,36 @@ async function startServer() {
     try {
       const col = await withLock(() => {
         const db = ensureDb();
-        const { Name, Mobile, Username, Password, AssignedAreas, Status } = req.body;
-        const uname = String(Username || '').trim();
-        if (!Name?.trim() || !uname || !Password) {
-          throw new Error('নাম, ইউজারনেম এবং পাসওয়ার্ড আবশ্যক।');
+        const b = (req.body || {}) as Record<string, unknown>;
+        const name = String(b.Name ?? '').trim();
+        const username = String(b.Username ?? '').trim();
+        const password = String(b.Password ?? '').trim();
+        if (!name || !username || !password) {
+          throw new Error('নাম, ইউজারনেম এবং পাসওয়ার্ড আবশ্যক।');
         }
-        if (!USERNAME_RE.test(uname)) {
-          throw new Error('ইউজারনেম ৩ থেকে ৩২ অক্ষরের ইংরেজি অক্ষর, সংখ্যা বা . _ - হতে হবে।');
+        if (!/^[A-Za-z0-9._-]{3,32}$/.test(username)) {
+          throw new Error('ইউজারনেম ৩–৩২ অক্ষরের হতে হবে (ইংরেজি অক্ষর, সংখ্যা, . _ -)।');
         }
-        const strongPwd = assertStrongPassword(String(Password), 'কালেক্টর পাসওয়ার্ড');
+        assertStrongPassword(password);
         if (
-          uname === db.settings.AdminUsername ||
-          db.collectors.some((c) => c.Username.toLowerCase() === uname.toLowerCase())
+          username === db.settings.AdminUsername ||
+          db.collectors.some((c) => c.Username === username)
         ) {
-          throw new Error('এই ইউজারনেমটি ইতিমধ্যেই ব্যবহৃত হয়েছে।');
+          throw new Error('এই ইউজারনেমটি ইতিমধ্যেই ব্যবহৃত হয়েছে।');
         }
         const row: Collector = {
           CollectorID: randomId('CL'),
-          Name: Name.trim(),
-          Mobile: (Mobile || '').trim(),
-          Username: uname,
-          Password: hashPassword(strongPwd),
-          AssignedAreas: Array.isArray(AssignedAreas) ? AssignedAreas : [],
-          Status: Status || 'এক্টিভ',
+          Name: name.slice(0, 120),
+          Mobile: String(b.Mobile ?? '').trim().slice(0, 40),
+          Username: username,
+          Password: hashPassword(password),
+          AssignedAreas: Array.isArray(b.AssignedAreas) ? b.AssignedAreas.map(String) : [],
+          Status: (b.Status === 'ডি-এক্টিভ' ? 'ডি-এক্টিভ' : 'এক্টিভ') as Collector['Status'],
           CreatedAt: todayStr(),
         };
         db.collectors.push(row);
         writeDbAtomic(db);
-        return { ...row, Password: '••••••' };
+        return { ...row, Password: MASKED_PASSWORD };
       });
       res.json({ collector: col });
     } catch (err) {
@@ -1744,31 +2015,29 @@ async function startServer() {
     try {
       const updated = await withLock(() => {
         const db = ensureDb();
+        const b = (req.body || {}) as Record<string, unknown>;
         const col = db.collectors.find((c) => c.CollectorID === req.params.id);
-        if (!col) throw new Error('কালেক্টর পাওয়া যায়নি।');
-        col.Name = String(req.body.Name || col.Name).trim();
-        col.Mobile = String(req.body.Mobile ?? col.Mobile).trim();
-
-        let shouldRevoke = false;
-        if (req.body.Password && req.body.Password !== '••••••') {
-          const strongPwd = assertStrongPassword(String(req.body.Password), 'কালেক্টর পাসওয়ার্ড');
-          col.Password = hashPassword(strongPwd);
-          shouldRevoke = true;
+        if (!col) throw new Error('কালেক্টর পাওয়া যায়নি।');
+        col.Name = String(b.Name || col.Name).trim().slice(0, 120);
+        col.Mobile = String(b.Mobile ?? col.Mobile).trim().slice(0, 40);
+        let passwordChanged = false;
+        if (b.Password && b.Password !== MASKED_PASSWORD) {
+          const pw = String(b.Password).trim();
+          assertStrongPassword(pw);
+          col.Password = hashPassword(pw);
+          passwordChanged = true;
         }
-        if (Array.isArray(req.body.AssignedAreas)) {
-          col.AssignedAreas = req.body.AssignedAreas;
+        if (Array.isArray(b.AssignedAreas)) {
+          col.AssignedAreas = b.AssignedAreas.map(String);
         }
-        if (req.body.Status) {
-          col.Status = req.body.Status;
-          if (col.Status !== 'এক্টিভ') {
-            shouldRevoke = true;
-          }
+        if (b.Status === 'এক্টিভ' || b.Status === 'ডি-এক্টিভ') {
+          col.Status = b.Status as Collector['Status'];
         }
         writeDbAtomic(db);
-        if (shouldRevoke) {
-          revokeSessionsFor('User', col.Username);
+        if (passwordChanged || col.Status !== 'এক্টিভ') {
+          revokeSessionsFor(col.Username);
         }
-        return { ...col, Password: '••••••' };
+        return { ...col, Password: MASKED_PASSWORD };
       });
       res.json({ collector: updated });
     } catch (err) {
@@ -1785,10 +2054,8 @@ async function startServer() {
         }
         const idx = db.collectors.findIndex((c) => c.CollectorID === req.params.id);
         if (idx === -1) throw new Error('কালেক্টর পাওয়া যায়নি।');
-        const removed = db.collectors[idx];
         db.collectors.splice(idx, 1);
         writeDbAtomic(db);
-        revokeSessionsFor('User', removed.Username);
       });
       res.json({ ok: true });
     } catch (err) {
@@ -1804,7 +2071,7 @@ async function startServer() {
         const col = db.collectors.find((c) => c.Username === collectorUsername);
         if (!col) throw new Error('কালেক্টর পাওয়া যায়নি।');
         const amt = Number(amount);
-        if (!Number.isFinite(amt) || amt <= 0) throw new Error('সঠিক জমার পরিমাণ লিখুন।');
+        if (!amt || amt <= 0) throw new Error('সঠিক জমার পরিমাণ লিখুন।');
         const row: CollectorDeposit = {
           DepositID: randomId('DP'),
           Date: date || todayStr(),
@@ -1826,7 +2093,7 @@ async function startServer() {
     }
   });
 
-  // Customers CRUD (RBAC Hardened)
+  // Customers CRUD
   app.post('/api/customers', authMiddleware, async (req: AuthedRequest, res) => {
     try {
       const customer = await withLock(() => {
@@ -1835,6 +2102,9 @@ async function startServer() {
         const data = req.body;
         const custId = String(data.CustomerID || '').trim();
         if (!custId) throw new Error('গ্রাহক আইডি আবশ্যক।');
+        if (!/^[A-Za-z0-9._-]{1,32}$/.test(custId)) {
+          throw new Error('গ্রাহক আইডিতে শুধু ইংরেজি অক্ষর, সংখ্যা এবং . _ - ব্যবহার করুন (সর্বোচ্চ ৩২)।');
+        }
         if (db.customers.some((c) => c.CustomerID.toLowerCase() === custId.toLowerCase())) {
           throw new Error('এই গ্রাহক আইডি ইতিমধ্যেই বিদ্যমান। অনুগ্রহ করে ভিন্ন আইডি দিন।');
         }
@@ -1842,9 +2112,15 @@ async function startServer() {
           throw new Error('আপনার নির্ধারিত এরিয়ার বাইরে গ্রাহক যোগ করার অনুমতি নেই।');
         }
         const connDate = data.ConnectionDate || todayStr();
-        // Only Admin may set an OpeningBalance on customer creation
-        const opening = user.role === 'Admin' ? Math.max(0, Number(data.OpeningBalance || 0)) : 0;
-        const monthlyBill = Math.max(0, Number(data.MonthlyBill || 0));
+        // Only admins may set an opening (previous-dues) balance
+        const opening = user.role === 'Admin' ? Number(data.OpeningBalance || 0) : 0;
+        const monthlyBill = Number(data.MonthlyBill || 0);
+        if (!Number.isFinite(opening) || opening < 0 || opening > MAX_PAYMENT_AMOUNT) {
+          throw new Error('পূর্বের বকেয়ার পরিমাণ সঠিক নয়।');
+        }
+        if (!Number.isFinite(monthlyBill) || monthlyBill < 0 || monthlyBill > MAX_PAYMENT_AMOUNT) {
+          throw new Error('মাসিক বিলের পরিমাণ সঠিক নয়।');
+        }
         const status = data.Status || 'এক্টিভ';
 
         const newCust: Customer = {
@@ -1913,33 +2189,34 @@ async function startServer() {
         const user = req.user!;
         const cust = db.customers.find((c) => c.CustomerID === req.params.id);
         if (!cust) throw new Error('গ্রাহক পাওয়া যায়নি।');
-
-        const d = req.body;
+        if (user.role === 'User' && !user.assignedAreas.includes(cust.Area)) {
+          throw new Error('অন্য এরিয়ার গ্রাহক এডিট করার অনুমতি নেই।');
+        }
+        const d = req.body || {};
         if (user.role === 'User') {
-          if (!user.assignedAreas.includes(cust.Area)) {
-            throw new Error('অন্য এরিয়ার গ্রাহক এডিট করার অনুমতি নেই।');
+          const differs = (a: unknown, b: unknown) => a !== undefined && String(a) !== String(b);
+          if (
+            differs(d.MonthlyBill, cust.MonthlyBill) ||
+            differs(d.Package, cust.Package) ||
+            differs(d.ServiceType, cust.ServiceType)
+          ) {
+            throw new Error('মাসিক বিল, প্যাকেজ বা সার্ভিস টাইপ শুধু অ্যাডমিন পরিবর্তন করতে পারবেন।');
           }
           if (d.Area !== undefined && !user.assignedAreas.includes(String(d.Area).trim())) {
-            throw new Error('আপনার নির্ধারিত এরিয়ার বাইরে গ্রাহক স্থানান্তরের অনুমতি নেই।');
-          }
-          if (
-            (d.MonthlyBill !== undefined && Number(d.MonthlyBill) !== cust.MonthlyBill) ||
-            (d.Package !== undefined && String(d.Package).trim() !== cust.Package) ||
-            (d.ServiceType !== undefined && d.ServiceType !== cust.ServiceType)
-          ) {
-            throw new Error('প্যাকেজ, সার্ভিসের ধরন বা মাসিক বিল শুধুমাত্র অ্যাডমিন পরিবর্তন করতে পারবেন।');
+            throw new Error('গ্রাহককে আপনার নির্ধারিত এরিয়ার বাইরে সরানো যাবে না।');
           }
         }
-
+        const newMonthly = Number(d.MonthlyBill ?? cust.MonthlyBill);
+        if (!Number.isFinite(newMonthly) || newMonthly < 0 || newMonthly > MAX_PAYMENT_AMOUNT) {
+          throw new Error('মাসিক বিলের পরিমাণ সঠিক নয়।');
+        }
         cust.Name = String(d.Name ?? cust.Name).trim();
         cust.Mobile = String(d.Mobile ?? cust.Mobile).trim();
         cust.Area = String(d.Area ?? cust.Area).trim();
         cust.Address = String(d.Address ?? cust.Address).trim();
-        if (user.role === 'Admin') {
-          cust.ServiceType = d.ServiceType ?? cust.ServiceType;
-          cust.Package = String(d.Package ?? cust.Package).trim();
-          cust.MonthlyBill = Number(d.MonthlyBill ?? cust.MonthlyBill);
-        }
+        cust.ServiceType = d.ServiceType ?? cust.ServiceType;
+        cust.Package = String(d.Package ?? cust.Package).trim();
+        cust.MonthlyBill = Number(d.MonthlyBill ?? cust.MonthlyBill);
         cust.Status = d.Status ?? cust.Status;
         cust.Note = String(d.Note ?? cust.Note).trim();
         writeDbAtomic(db);
@@ -1990,12 +2267,16 @@ async function startServer() {
     }
   });
 
-  // Automatic Monthly Billing Generator (Admin only or scoped)
-  app.post('/api/bills/generate', authMiddleware, requireAdmin, async (req: AuthedRequest, res) => {
+  // Automatic Monthly Billing Generator
+  app.post('/api/bills/generate', authMiddleware, async (req: AuthedRequest, res) => {
     try {
       const summary = await withLock(() => {
         const db = ensureDb();
+        const user = req.user!;
         const targetMonth: string = String(req.body?.billingMonth || todayStr().slice(0, 7));
+        if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(targetMonth)) {
+          throw new Error('বিলিং মাস সঠিক নয়।');
+        }
         const mode: 'dueOnly' | 'allActive' = req.body?.mode || 'allActive';
         const refToday = todayStr();
 
@@ -2003,6 +2284,9 @@ async function startServer() {
         let skippedCount = 0;
 
         for (const cust of db.customers) {
+          if (user.role === 'User' && !user.assignedAreas.includes(cust.Area)) {
+            continue;
+          }
           if (cust.Status !== 'এক্টিভ') {
             skippedCount++;
             continue;
@@ -2066,11 +2350,15 @@ async function startServer() {
           if (user.role === 'User' && !user.assignedAreas.includes(customer.Area)) {
             throw new Error('আপনার নির্ধারিত এরিয়ার বাইরে বিল আদায়ের অনুমতি নেই।');
           }
-
-          if (user.role === 'User' && date) {
-            const diff = daysBetweenDates(String(date).trim(), todayStr());
-            if (Number.isNaN(diff) || Math.abs(diff) > 1) {
-              throw new Error('কালেক্টর শুধুমাত্র আজ বা ±১ দিনের তারিখে বিল আদায় এন্ট্রি করতে পারবেন।');
+          if (date !== undefined && date !== null && date !== '') {
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
+              throw new Error('তারিখের ফরম্যাট সঠিক নয়।');
+            }
+            if (user.role === 'User') {
+              const diffDays = Math.abs((Date.parse(String(date)) - Date.parse(todayStr())) / 86400000);
+              if (!(diffDays <= 1)) {
+                throw new Error('কালেক্টর শুধু আজকের তারিখে (±১ দিন) আদায়ের এন্ট্রি দিতে পারবেন।');
+              }
             }
           }
 
@@ -2110,6 +2398,7 @@ async function startServer() {
         if (idx === -1) throw new Error('রিসিট পাওয়া যায়নি।');
         const rec = db.collections[idx];
 
+        // Reverse PaidAmount back to matching Bills starting from BillingMonth
         let toReverse = rec.Amount;
         const custBills = db.bills.filter((b) => b.CustomerID === rec.CustomerID);
         const startIdx = custBills.findIndex((b) => b.BillingMonth === rec.BillingMonth);
@@ -2226,7 +2515,7 @@ async function startServer() {
         const db = ensureDb();
         const { Date: dt, Category, PaymentAccount, Amount, Note } = req.body;
         const amt = Number(Amount);
-        if (!Number.isFinite(amt) || amt <= 0) throw new Error('সঠিক খরচের পরিমাণ লিখুন।');
+        if (!amt || amt <= 0) throw new Error('সঠিক খরচের পরিমাণ লিখুন।');
         const row: Expense = {
           ExpenseID: randomId('EX'),
           Date: dt || todayStr(),
@@ -2264,66 +2553,64 @@ async function startServer() {
     }
   });
 
-  // Manual / Resend Receipt SMS (Rate limited)
-  app.post(
-    '/api/sms/send',
-    authMiddleware,
-    rateLimit('sms-send', 30, 60 * 1000, (req) => (req as AuthedRequest).user?.username || getClientIp(req)),
-    async (req: AuthedRequest, res) => {
-      try {
-        const { receiptId, customerId, message } = req.body as {
-          receiptId?: string;
-          customerId?: string;
-          message?: string;
-        };
-        const db = ensureDb();
-        const user = req.user!;
+  // Manual / Resend Receipt SMS (Admin or Collector for assigned areas)
+  app.post('/api/sms/send', authMiddleware, rateLimit('sms-send', 30, 60_000), async (req: AuthedRequest, res) => {
+    try {
+      const { receiptId, customerId, message } = req.body as {
+        receiptId?: string;
+        customerId?: string;
+        message?: string;
+      };
+      const db = ensureDb();
+      const user = req.user!;
 
-        let targetCustomer: Customer | undefined;
-        let receipt: Collection | undefined;
-
-        if (receiptId) {
-          receipt = db.collections.find((c) => c.ReceiptID === receiptId);
-          if (!receipt) throw new Error('রিসিট পাওয়া যায়নি।');
-          targetCustomer = db.customers.find((c) => c.CustomerID === receipt!.CustomerID);
-        } else if (customerId) {
-          targetCustomer = db.customers.find((c) => c.CustomerID === customerId);
-        }
-
-        if (!targetCustomer) throw new Error('গ্রাহক পাওয়া যায়নি।');
-        if (user.role === 'User' && !user.assignedAreas.includes(targetCustomer.Area)) {
-          throw new Error('আপনার নির্ধারিত এরিয়ার বাইরে SMS পাঠানোর অনুমতি নেই।');
-        }
-        if (!targetCustomer.Mobile) throw new Error('গ্রাহকের মোবাইল নম্বর পাওয়া যায়নি।');
-
-        const smsText =
-          message && message.trim()
-            ? message.trim()
-            : receipt
-              ? formatBengaliCollectionSms({
-                  settings: db.settings,
-                  receipt,
-                  monthLabel: getMonthLabelBn(receipt.BillingMonth),
-                })
-              : `সম্মানিত ${targetCustomer.Name} (${targetCustomer.CustomerID}), ${db.settings.CompanyName}-এর পক্ষ থেকে শুভেচ্ছা।`;
-
-        const smsLog = await dispatchSmsAndLog({
-          customerId: targetCustomer.CustomerID,
-          customerName: targetCustomer.Name,
-          mobile: targetCustomer.Mobile,
-          receiptId: receipt?.ReceiptID || 'MANUAL',
-          message: smsText,
-          settings: db.settings,
-          createId: randomId,
-          persistSmsLog,
-        });
-
-        res.json({ smsLog });
-      } catch (err) {
-        res.status(400).json({ error: (err as Error).message });
+      if (typeof message === 'string' && message.length > 480) {
+        throw new Error('বার্তা অনেক দীর্ঘ (সর্বোচ্চ ৪৮০ অক্ষর)।');
       }
+      let targetCustomer: Customer | undefined;
+      let receipt: Collection | undefined;
+
+      if (receiptId) {
+        receipt = db.collections.find((c) => c.ReceiptID === receiptId);
+        if (!receipt) throw new Error('রিসিট পাওয়া যায়নি।');
+        targetCustomer = db.customers.find((c) => c.CustomerID === receipt!.CustomerID);
+      } else if (customerId) {
+        targetCustomer = db.customers.find((c) => c.CustomerID === customerId);
+      }
+
+      if (!targetCustomer) throw new Error('গ্রাহক পাওয়া যায়নি।');
+      if (user.role === 'User' && !user.assignedAreas.includes(targetCustomer.Area)) {
+        throw new Error('আপনার নির্ধারিত এরিয়ার বাইরে SMS পাঠানোর অনুমতি নেই।');
+      }
+      if (!targetCustomer.Mobile) throw new Error('গ্রাহকের মোবাইল নম্বর পাওয়া যায়নি।');
+
+      const smsText =
+        message && message.trim()
+          ? message.trim()
+          : receipt
+            ? formatBengaliCollectionSms({
+                settings: db.settings,
+                receipt,
+                monthLabel: getMonthLabelBn(receipt.BillingMonth),
+              })
+            : `সম্মানিত ${targetCustomer.Name} (${targetCustomer.CustomerID}), ${db.settings.CompanyName}-এর পক্ষ থেকে শুভেচ্ছা।`;
+
+      const smsLog = await dispatchSmsAndLog({
+        customerId: targetCustomer.CustomerID,
+        customerName: targetCustomer.Name,
+        mobile: targetCustomer.Mobile,
+        receiptId: receipt?.ReceiptID || 'MANUAL',
+        message: smsText,
+        settings: db.settings,
+        createId: randomId,
+        persistSmsLog,
+      });
+
+      res.json({ smsLog });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
     }
-  );
+  });
 
   // Bulk SMS Broadcast (Admin only)
   app.post('/api/sms/broadcast', authMiddleware, requireAdmin, async (req, res) => {
@@ -2336,15 +2623,23 @@ async function startServer() {
       }
       const db = ensureDb();
       const logs: SmsLog[] = [];
+      const baseUrl = getPublicBaseUrl(req);
+      const needsLink = items.slice(0, 100).some((i) => String(i?.message || '').includes('{PayLink}'));
+      if (needsLink && !baseUrl) {
+        throw new Error(
+          'পেমেন্ট লিংক বানাতে .env ফাইলে APP_URL="https://আপনার-ওয়েবসাইট" দিন (localhost লিংক গ্রাহকের ফোনে খুলবে না)।'
+        );
+      }
       for (const item of items.slice(0, 100)) {
         const cust = db.customers.find((c) => c.CustomerID === item.customerId);
         if (!cust || !cust.Mobile) continue;
+        const payLink = `${baseUrl}/?page=pay&cid=${encodeURIComponent(cust.CustomerID)}`;
         const log = await dispatchSmsAndLog({
           customerId: cust.CustomerID,
           customerName: cust.Name,
           mobile: cust.Mobile,
           receiptId: 'BROADCAST',
-          message: item.message,
+          message: String(item.message || '').replace(/\{PayLink\}/g, payLink).slice(0, 480),
           settings: db.settings,
           createId: randomId,
           persistSmsLog,
@@ -2357,87 +2652,188 @@ async function startServer() {
     }
   });
 
-  // Settings (Admin only, whitelisted fields, CurrentAdminPassword required on password change)
+  // Due-bill reminders: preview who would get an SMS today / send now (admin only)
+  const reminderReasonText: Record<string, string> = {
+    'no-base-url':
+      'পেমেন্ট লিংক বানাতে .env ফাইলে APP_URL="https://আপনার-ওয়েবসাইট" দিন (localhost লিংক কাজ করবে না)।',
+    'sms-disabled': 'SMS বন্ধ আছে। সেটিংস থেকে "SMS সার্ভিস চালু" করুন।',
+    busy: 'আরেকটি রিমাইন্ডার পাঠানো চলছে, একটু পরে আবার চেষ্টা করুন।',
+  };
+  const reminderResponse = (r: ReminderResult) => {
+    const db = ensureDb();
+    return {
+      ...r,
+      enabled: getDueReminderConfig(db.settings).Enabled,
+      lastRunDate: db.dueReminder?.lastRunDate || '',
+    };
+  };
+
+  app.get('/api/reminders/due-preview', authMiddleware, requireAdmin, async (req, res) => {
+    try {
+      const r = await runDueReminders({ auto: false, dryRun: true, baseUrl: getPublicBaseUrl(req) });
+      res.json(reminderResponse(r));
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post(
+    '/api/reminders/due-run',
+    authMiddleware,
+    requireAdmin,
+    rateLimit('due-run', 5, 60_000),
+    async (req, res) => {
+      try {
+        const r = await runDueReminders({ auto: false, dryRun: false, baseUrl: getPublicBaseUrl(req) });
+        if (!r.ok && r.reason && reminderReasonText[r.reason]) {
+          res.status(400).json({ error: reminderReasonText[r.reason] });
+          return;
+        }
+        res.json(reminderResponse(r));
+      } catch (err) {
+        res.status(400).json({ error: (err as Error).message });
+      }
+    }
+  );
+
+  // Settings (Admin only) – whitelisted fields, hashed password,
+  // and the CURRENT password is required to set a new one.
   app.put('/api/settings', authMiddleware, requireAdmin, async (req: AuthedRequest, res) => {
     try {
-      const updated = await withLock(() => {
+      const safe = await withLock(() => {
         const db = ensureDb();
-        const body = req.body as Partial<SettingsData> & { CurrentAdminPassword?: string };
-
-        const nextSettings: SettingsData = {
-          ...db.settings,
-          CompanyName: body.CompanyName !== undefined ? String(body.CompanyName).trim() : db.settings.CompanyName,
-          BusinessType: body.BusinessType !== undefined ? String(body.BusinessType).trim() : db.settings.BusinessType,
-          Address: body.Address !== undefined ? String(body.Address).trim() : db.settings.Address,
-          Phone: body.Phone !== undefined ? String(body.Phone).trim() : db.settings.Phone,
-          ScrollingNotice:
-            body.ScrollingNotice !== undefined ? String(body.ScrollingNotice).trim() : db.settings.ScrollingNotice,
-          BkashNumber: body.BkashNumber !== undefined ? String(body.BkashNumber).trim() : db.settings.BkashNumber,
-          BkashType: body.BkashType ?? db.settings.BkashType,
-          NagadNumber: body.NagadNumber !== undefined ? String(body.NagadNumber).trim() : db.settings.NagadNumber,
-          NagadType: body.NagadType ?? db.settings.NagadType,
-          RocketNumber: body.RocketNumber !== undefined ? String(body.RocketNumber).trim() : db.settings.RocketNumber,
-          BankDetails: {
-            ...db.settings.BankDetails,
-            ...(body.BankDetails || {}),
-          },
-          SmsConfig: {
-            ...(db.settings.SmsConfig || DEFAULT_SMS_CONFIG),
-            ...(body.SmsConfig || {}),
-          },
+        const b = (req.body || {}) as Record<string, unknown>;
+        const text = (v: unknown, max: number, label: string): string => {
+          const s = String(v ?? '').trim();
+          if (s.length > max) throw new Error(`${label} অনেক দীর্ঘ (সর্বোচ্চ ${max} অক্ষর)।`);
+          return s;
         };
 
-        if (body.AdminUsername !== undefined) {
-          const nextUname = String(body.AdminUsername).trim();
-          if (!USERNAME_RE.test(nextUname)) {
-            throw new Error('অ্যাডমিন ইউজারনেম ৩ থেকে ৩২ অক্ষরের ইংরেজি অক্ষর, সংখ্যা বা . _ - হতে হবে।');
-          }
-          if (db.collectors.some((c) => c.Username.toLowerCase() === nextUname.toLowerCase())) {
-            throw new Error('এই ইউজারনেমটি একজন কালেক্টরের জন্য ব্যবহৃত হচ্ছে।');
-          }
-          nextSettings.AdminUsername = nextUname;
+        const next: SettingsData = {
+          ...db.settings,
+          BankDetails: { ...db.settings.BankDetails },
+          SmsConfig: { ...(db.settings.SmsConfig || DEFAULT_SMS_CONFIG) },
+        };
+
+        if (b.CompanyName !== undefined) next.CompanyName = text(b.CompanyName, 120, 'কোম্পানির নাম');
+        if (b.BusinessType !== undefined) next.BusinessType = text(b.BusinessType, 80, 'ব্যবসার ধরন');
+        if (b.Address !== undefined) next.Address = text(b.Address, 300, 'ঠিকানা');
+        if (b.Phone !== undefined) next.Phone = text(b.Phone, 40, 'ফোন নম্বর');
+        if (b.ScrollingNotice !== undefined) next.ScrollingNotice = text(b.ScrollingNotice, 600, 'নোটিস');
+        if (b.BkashNumber !== undefined) next.BkashNumber = text(b.BkashNumber, 40, 'বিকাশ নম্বর');
+        if (b.NagadNumber !== undefined) next.NagadNumber = text(b.NagadNumber, 40, 'নগদ নম্বর');
+        if (b.RocketNumber !== undefined) next.RocketNumber = text(b.RocketNumber, 40, 'রকেট নম্বর');
+
+        const accountTypes = ['Merchant', 'Personal', 'Agent'];
+        if (typeof b.BkashType === 'string' && accountTypes.includes(b.BkashType)) {
+          next.BkashType = b.BkashType as SettingsData['BkashType'];
+        }
+        if (typeof b.NagadType === 'string' && accountTypes.includes(b.NagadType)) {
+          next.NagadType = b.NagadType as SettingsData['NagadType'];
         }
 
-        if (body.PaymentGatewayWebhookSecret !== undefined) {
-          const sec = String(body.PaymentGatewayWebhookSecret).trim();
-          if (sec.length < 16 || sec.length > 128 || sec === DEMO_WEBHOOK_SECRET) {
-            throw new Error('ওয়েবহুক সিক্রেট ১৬ থেকে ১২৮ অক্ষরের মধ্যে হতে হবে (ডেমো সিক্রেট অনুমোদিত নয়)।');
+        if (b.BankDetails && typeof b.BankDetails === 'object') {
+          const bd = b.BankDetails as Record<string, unknown>;
+          for (const k of ['BankName', 'AccountName', 'AccountNo', 'Branch', 'Routing'] as const) {
+            if (bd[k] !== undefined) next.BankDetails[k] = text(bd[k], 120, 'ব্যাংকের তথ্য');
           }
-          nextSettings.PaymentGatewayWebhookSecret = sec;
+        }
+
+        if (b.SmsConfig && typeof b.SmsConfig === 'object') {
+          const sc = b.SmsConfig as Record<string, unknown>;
+          if (typeof sc.Enabled === 'boolean') next.SmsConfig.Enabled = sc.Enabled;
+          if (typeof sc.Provider === 'string' && ['twilio', 'local_bd', 'sandbox'].includes(sc.Provider)) {
+            next.SmsConfig.Provider = sc.Provider as SmsProvider;
+          }
+          if (sc.SenderId !== undefined) next.SmsConfig.SenderId = text(sc.SenderId, 20, 'Sender ID');
+          if (sc.PaymentSmsTemplate !== undefined) {
+            next.SmsConfig.PaymentSmsTemplate = text(sc.PaymentSmsTemplate, 600, 'SMS টেমপ্লেট');
+          }
+        }
+
+        if (b.DueReminder && typeof b.DueReminder === 'object') {
+          const dr = b.DueReminder as Record<string, unknown>;
+          const cur = getDueReminderConfig(db.settings);
+          const intIn = (v: unknown, lo: number, hi: number, label: string): number => {
+            const n = Math.floor(Number(v));
+            if (!Number.isFinite(n) || n < lo || n > hi) {
+              throw new Error(`${label} ${lo}–${hi} এর মধ্যে হতে হবে।`);
+            }
+            return n;
+          };
+          if (typeof dr.Enabled === 'boolean') cur.Enabled = dr.Enabled;
+          if (typeof dr.AutoGenerateBills === 'boolean') cur.AutoGenerateBills = dr.AutoGenerateBills;
+          if (dr.SendHour !== undefined) cur.SendHour = intIn(dr.SendHour, 0, 23, 'SMS যাওয়ার সময় (ঘণ্টা)');
+          if (dr.DeadlineDay !== undefined) cur.DeadlineDay = intIn(dr.DeadlineDay, 1, 31, 'পেমেন্টের শেষ তারিখ');
+          if (dr.Template !== undefined) {
+            const tpl = text(dr.Template, 600, 'বার্তা');
+            if (!tpl) throw new Error('বার্তা খালি রাখা যাবে না।');
+            cur.Template = tpl;
+          }
+          next.DueReminder = cur;
+        }
+
+        let usernameChanged = false;
+        if (b.AdminUsername !== undefined) {
+          const nu = String(b.AdminUsername).trim();
+          if (nu !== db.settings.AdminUsername) {
+            if (!/^[A-Za-z0-9._-]{3,32}$/.test(nu)) {
+              throw new Error('অ্যাডমিন ইউজারনেম ৩–৩২ অক্ষরের হতে হবে (ইংরেজি অক্ষর, সংখ্যা, . _ -)।');
+            }
+            if (db.collectors.some((c) => c.Username === nu)) {
+              throw new Error('এই ইউজারনেমটি কোনো কালেক্টর ব্যবহার করছেন।');
+            }
+            next.AdminUsername = nu;
+            usernameChanged = true;
+          }
+        }
+
+        if (b.PaymentGatewayWebhookSecret !== undefined) {
+          const ns = String(b.PaymentGatewayWebhookSecret).trim();
+          if (ns && ns !== db.settings.PaymentGatewayWebhookSecret) {
+            if (ns.length < 16 || ns.length > 128 || ns === DEMO_WEBHOOK_SECRET) {
+              throw new Error('ওয়েবহুক সিক্রেট কমপক্ষে ১৬ অক্ষরের এবং সহজে অনুমান করা যায় না এমন হতে হবে।');
+            }
+            next.PaymentGatewayWebhookSecret = ns;
+          }
         }
 
         let passwordChanged = false;
-        if (body.AdminPassword && String(body.AdminPassword).trim()) {
-          if (!verifyPassword(body.CurrentAdminPassword, db.settings.AdminPassword)) {
-            throw new Error('নতুন পাসওয়ার্ড সেট করতে বর্তমান অ্যাডমিন পাসওয়ার্ড সঠিকভাবে দিন।');
+        const newPw = typeof b.AdminPassword === 'string' ? b.AdminPassword.trim() : '';
+        if (newPw) {
+          const current = typeof b.CurrentAdminPassword === 'string' ? b.CurrentAdminPassword : '';
+          if (!verifyPassword(current, db.settings.AdminPassword)) {
+            throw new Error('বর্তমান অ্যাডমিন পাসওয়ার্ড সঠিক নয়।');
           }
-          const strongPwd = assertStrongPassword(String(body.AdminPassword), 'অ্যাডমিন পাসওয়ার্ড');
-          nextSettings.AdminPassword = hashPassword(strongPwd);
+          assertStrongPassword(newPw);
+          next.AdminPassword = hashPassword(newPw);
           passwordChanged = true;
         }
 
-        const usernameChanged = nextSettings.AdminUsername !== db.settings.AdminUsername;
-        db.settings = nextSettings;
+        db.settings = next;
         writeDbAtomic(db);
 
-        if (passwordChanged || usernameChanged) {
-          revokeSessionsFor('Admin', undefined, req.user?.token);
-          if (req.user) {
-            req.user.username = nextSettings.AdminUsername;
+        if (usernameChanged) {
+          for (const [, u] of sessions) {
+            if (u.role === 'Admin') u.username = next.AdminUsername;
           }
         }
+        if (passwordChanged) {
+          // Sign out every other admin session after a password change
+          revokeSessionsFor(next.AdminUsername, req.user?.token);
+        }
 
-        const { AdminPassword: _hidden, ...safe } = db.settings;
-        return safe;
+        const { AdminPassword: _hidden, ...rest } = db.settings;
+        return rest;
       });
-      res.json({ settings: updated });
+      res.json({ settings: safe });
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }
   });
 
   // Vite Dev Middleware or Static Production Build
-  if (!isProd) {
+  if (!IS_PROD) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -2451,16 +2847,44 @@ async function startServer() {
     });
   }
 
-  // Generic Error Handler (no stack traces leaked to client)
-  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
-    console.error('Unhandled server error:', err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'সার্ভারে অপ্রত্যাশিত ত্রুটি হয়েছে।' });
+  // Generic JSON error handler (no stack traces or internals leaked)
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    const status = (err as { status?: number })?.status;
+    if (status && status >= 400 && status < 500) {
+      res.status(status).json({ error: 'অনুরোধটি সঠিক নয়।' });
+      return;
     }
+    console.error('Unhandled server error:', err);
+    res.status(500).json({ error: 'সার্ভারে ত্রুটি হয়েছে।' });
   });
 
-  app.listen(3000, '0.0.0.0', () => {
-    console.log('NetBill ISP server listening on http://0.0.0.0:3000');
+  const port = Number(process.env.PORT) || 3000;
+  const host = process.env.HOST || '0.0.0.0';
+
+  // Automatic due reminders: checked every 5 minutes, sent once per day after the configured hour
+  const reminderTick = () => {
+    ensureMonthlyBills(false)
+      .then(() => runDueReminders({ auto: true, dryRun: false, baseUrl: getEnvBaseUrl() }))
+      .then((r) => {
+        if (r.reason === 'no-base-url' && warnedNoBaseUrlOn !== r.date) {
+          warnedNoBaseUrlOn = r.date;
+          console.warn('⚠ বকেয়া রিমাইন্ডার পাঠানো যায়নি: .env ফাইলে APP_URL="https://আপনার-ওয়েবসাইট" দিন।');
+        }
+        if (r.ok && (r.sent > 0 || r.failed > 0)) {
+          console.log(`পেমেন্ট লিংকের SMS: ${r.sent} জনকে পাঠানো হয়েছে, ${r.failed} ব্যর্থ।`);
+        }
+      })
+      .catch((e) => console.error('Due reminder error:', e));
+  };
+  setTimeout(reminderTick, 30_000).unref();
+  setInterval(reminderTick, 5 * 60_000).unref();
+  app.listen(port, host, () => {
+    console.log(`NetBill ISP server listening on http://${host}:${port}`);
+    if (!IS_PROD) {
+      console.log(
+        'ℹ ডেভেলপমেন্ট মোড চলছে। লাইভ ব্যবহারের জন্য: npm run build  এবং তারপর  npm run serve'
+      );
+    }
   });
 }
 

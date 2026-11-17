@@ -29,6 +29,8 @@ interface PayPortalProps {
 
 type DigitalMethod = Exclude<PaymentMethod, 'Cash'>;
 
+const SAMPLE_CUSTOMER_IDS = ['NB-1002', 'NB-1003', 'NB-1006', 'NB-1007'];
+
 export const PayPortal: React.FC<PayPortalProps> = ({ initialCid = '', onExitPortal }) => {
   const [query, setQuery] = useState(initialCid);
   const [loading, setLoading] = useState(false);
@@ -44,11 +46,13 @@ export const PayPortal: React.FC<PayPortalProps> = ({ initialCid = '', onExitPor
   const [submitting, setSubmitting] = useState(false);
   const [submittedTicket, setSubmittedTicket] = useState<EPaymentRequest | null>(null);
   const [copiedKey, setCopiedKey] = useState('');
+  const [showAdvanceForm, setShowAdvanceForm] = useState(false);
 
   const runLookup = async (searchText: string) => {
     setLoading(true);
     setError('');
     setSubmittedTicket(null);
+    setShowAdvanceForm(false);
     try {
       const res = await api.publicLookup(searchText);
       setData(res);
@@ -174,6 +178,23 @@ export const PayPortal: React.FC<PayPortalProps> = ({ initialCid = '', onExitPor
               {loading ? 'খোঁজা হচ্ছে...' : 'বিল দেখুন'}
             </button>
           </form>
+
+          <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+            <span>নমুনা আইডি:</span>
+            {SAMPLE_CUSTOMER_IDS.map((sampleId) => (
+              <button
+                key={sampleId}
+                type="button"
+                onClick={() => {
+                  setQuery(sampleId);
+                  runLookup(sampleId);
+                }}
+                className="rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1 font-mono-num text-xs font-medium text-slate-700 hover:border-[#0f4c5c] hover:bg-teal-50/40 hover:text-[#0f4c5c]"
+              >
+                {sampleId}
+              </button>
+            ))}
+          </div>
 
           {error && (
             <div className="mt-4 flex items-center gap-2 rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-sm text-red-700">
@@ -319,13 +340,60 @@ export const PayPortal: React.FC<PayPortalProps> = ({ initialCid = '', onExitPor
               )}
             </div>
 
-            {/* Right Column: Payment Methods & Proof Submission */}
+            {/* Right Column: Zero-Due Confirmation Card OR Payment Methods & Proof Submission */}
             <div className="space-y-6 lg:col-span-7">
-              <section className="rounded-xl border border-slate-200 bg-white p-5">
-                <h3 className="text-base font-semibold text-slate-900">পেমেন্ট মাধ্যম নির্বাচন করুন</h3>
-                <p className="mt-0.5 text-xs text-slate-500">
-                  নিচের যেকোনো মাধ্যমে টাকা পাঠিয়ে নিচে TrxID / রেফারেন্স নম্বর জমা দিন
-                </p>
+              {data.totalDue <= 0 && !showAdvanceForm ? (
+                <section className="rounded-xl border border-emerald-200 bg-emerald-50/70 px-6 py-10 text-center">
+                  <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-emerald-500 text-white shadow-sm">
+                    <Check className="h-7 w-7 stroke-[3]" />
+                  </div>
+                  <h3 className="mt-4 text-xl font-bold text-emerald-800">
+                    আপনার কোনো বকেয়া নেই
+                  </h3>
+                  <p className="mt-1.5 text-sm text-emerald-700">
+                    সব বিল পরিশোধ করা আছে। ধন্যবাদ!
+                  </p>
+                  {data.lastPayment && (
+                    <p className="mt-4 text-xs font-medium text-emerald-800">
+                      সর্বশেষ পেমেন্ট:{' '}
+                      <span className="font-mono-num">{data.lastPayment.Date}</span> ·{' '}
+                      <span className="font-semibold tabular-nums">
+                        {formatBnCurrency(data.lastPayment.Amount)}
+                      </span>
+                    </p>
+                  )}
+                  <p className="mt-3 text-xs text-slate-600">
+                    এই লিংকটি সংরক্ষণ করে রাখুন — নতুন মাসের বিল হলে এই লিংকেই দেখতে পাবেন।
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setShowAdvanceForm(true)}
+                    className="mt-5 inline-flex items-center justify-center rounded-lg border border-emerald-300 bg-white px-4 py-2 text-xs font-semibold text-emerald-800 hover:bg-emerald-100/60"
+                  >
+                    অগ্রিম বিল পরিশোধ করতে চান?
+                  </button>
+                </section>
+              ) : (
+                <section className="rounded-xl border border-slate-200 bg-white p-5">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <h3 className="text-base font-semibold text-slate-900">
+                        পেমেন্ট মাধ্যম নির্বাচন করুন
+                      </h3>
+                      <p className="mt-0.5 text-xs text-slate-500">
+                        নিচের যেকোনো মাধ্যমে টাকা পাঠিয়ে নিচে TrxID / রেফারেন্স নম্বর জমা দিন
+                      </p>
+                    </div>
+                    {data.totalDue <= 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setShowAdvanceForm(false)}
+                        className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-medium text-slate-600 hover:bg-slate-100"
+                      >
+                        বন্ধ করুন
+                      </button>
+                    )}
+                  </div>
 
                 {/* Method Tabs */}
                 <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
@@ -578,6 +646,7 @@ export const PayPortal: React.FC<PayPortalProps> = ({ initialCid = '', onExitPor
                   </button>
                 </form>
               </section>
+              )}
             </div>
           </div>
         )}
